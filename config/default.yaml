@@ -1,0 +1,82 @@
+# Diffusion²-based Flow-Dependent Ensemble Generation — default config.
+
+# Data
+data:
+  normalized_path: 'data/era5_normalized.zarr'
+  stats_path: 'data/normalization_stats.zarr'
+  variables: ['t', 'u', 'v']     # temperature, u-wind, v-wind
+  n_channels: 3
+  spatial: [64, 64]               # H x W (한반도 patch)
+  time_step_hours: 6
+
+  splits:
+    train:      ['2000-01-01', '2019-12-31']
+    validation: ['2020-01-01', '2021-12-31']
+    test:       ['2022-01-01', '2022-12-31']
+
+  load_into_memory: true   # train data를 RAM에 전체 로드 (~4.5GB)
+
+# Model
+model:
+  encoder:
+    in_channels: 3        # 변수 수와 일치
+    hidden_channels: 64
+    num_layers: 2
+
+  unet:
+    base_channels: 64
+    channel_mults: [1, 2, 4, 8]
+    num_res_blocks: 2
+    attention_resolutions: [0, 1]  # lower 2 resolutions (bottom-indexed)
+    time_emb_dim: 256
+    dropout: 0.1
+    pos_emb_channels: 8   # 학습 가능한 2D position embedding 채널 수 (0이면 비활성화)
+
+  dual_head:
+    log_var_clip: [-10.0, 10.0]
+
+# Diffusion
+diffusion:
+  M: 200
+  beta_start: 1.0e-4
+  beta_end: 0.05
+
+# Training
+# batch_size는 *per-process* (DDP 각 GPU당) 크기.
+# 2 GPU 학습 시: per_process_batch × num_processes = global batch.
+training:
+  batch_size: 64       # 2 GPU → global 128 (단일 GPU 초기 학습과 일치)
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  total_epochs: 200
+  num_workers: 4
+  grad_clip: 1.0
+
+  curriculum:
+    stage1_epochs: 50   # DDPM_past only
+    stage2_epochs: 100  # DDPM_main only (past frozen)
+    stage3_epochs: 50   # Joint
+
+  # Auxiliary sampling during training (DDPM_past chain).
+  # 추론용과 같은 sampler를 써서 cond_main의 train/inference 분포를 일치시킴
+  # (OOD 방지). Sub-sampled DDPM은 매 step에서 학습된 픽셀별 log_var를 사용.
+  aux_sampler:
+    type: 'ddpm'
+    num_steps: 50     # full M=200의 1/4로 sub-sample
+
+  checkpoint_every: 10
+  validation_every: 5
+
+# Inference
+inference:
+  sampler:
+    type: 'ddpm'      # 학습 aux_sampler와 동일하게 유지 (OOD 방지)
+    num_steps: 50
+
+  ensemble_size: 20
+
+# Logging
+logging:
+  output_dir: 'outputs/'
+  save_visualizations: true
+  log_every: 100

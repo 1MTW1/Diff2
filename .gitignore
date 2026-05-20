@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Data (1.3GB ERA5 .zarr — preprocess 스크립트로 재생성 가능)
+data/
+
+# Training outputs (checkpoints, figures, metrics — 32GB)
+outputs/
+
+# Claude Code local settings
+.claude/
+
+# OS / editor
+.DS_Store
