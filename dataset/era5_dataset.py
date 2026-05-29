@@ -127,3 +127,59 @@ class ERA5NormalizedDataset(Dataset):
             "x_t":    torch.from_numpy(x_t),
             "time_t": self.times[abs_idx],
         }
+
+
+class ERA5PairDataset(Dataset):
+    """연속 2시점 기상장을 채널 concat 형태로 반환 — VAE(Stage 0) 학습용.
+
+    diffusion target은 항상 연속 2시점 쌍(`[x_{t-3},x_{t-2}]`, `[x_t,x_{t+1}]`)이므로
+    VAE는 split 내 모든 연속 2시점 쌍의 분포를 보고 학습한다.
+
+    반환: `(2*C, H, W)` = `(6, 64, 64)` 텐서 (frame0 채널 ‖ frame1 채널).
+    """
+
+    SPLIT_RANGES = ERA5NormalizedDataset.SPLIT_RANGES
+
+    def __init__(
+        self,
+        normalized_path: str = "data/era5_normalized.zarr",
+        split: str = "train",
+        load_into_memory: bool = False,
+    ):
+        super().__init__()
+        if split not in self.SPLIT_RANGES:
+            raise ValueError(f"Unknown split: {split}")
+        self.split = split
+
+        ds = xr.open_zarr(normalized_path)
+        start, end = self.SPLIT_RANGES[split]
+        ds_split = ds.sel(time=slice(start, end))
+        self.times = ds_split.time.values
+        self.n_times = len(self.times)
+        if self.n_times < 2:
+            raise RuntimeError(
+                f"Split '{split}' too short for pairs: n_times={self.n_times}"
+            )
+
+        if load_into_memory:
+            self.data = ds_split["normalized"].values.astype(np.float32)
+            self.zarr_handle = None
+        else:
+            self.data = None
+            self.zarr_handle = ds_split["normalized"]
+
+    def __len__(self) -> int:
+        return self.n_times - 1
+
+    def _get_window(self, start: int, end: int) -> np.ndarray:
+        if self.data is not None:
+            return self.data[start:end]
+        return self.zarr_handle.isel(
+            time=slice(start, end)
+        ).values.astype(np.float32)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        chunk = self._get_window(idx, idx + 2)        # (2, C, H, W)
+        C, H, W = chunk.shape[1:]
+        pair = chunk.reshape(2 * C, H, W)             # (6, 64, 64)
+        return torch.from_numpy(pair)

@@ -1,5 +1,17 @@
-# Diffusion²-LDM — Latent Diffusion 기반 Flow-Dependent Ensemble Generation.
-# instruction_v2.md (픽셀 공간 Dual-DDPM → LDM 변환)에 따른 설정.
+# Diffusion²-LDM — LDM/SD 프로토콜 (재매개변수화 z) 실험 config.
+#
+# `config/default.yaml`와 동일하되 latent_norm.stats_path만 분리해
+# stats과 학습 체크포인트가 기존 실험(μ-only)과 섞이지 않게 한다.
+#
+# 변경점 (vs default.yaml):
+#   latent_norm.stats_path : outputs/vae/latent_stats.pt
+#                          → outputs/vae/latent_stats_reparam.pt
+#
+# 코드 측 차이 (default.yaml과 default_reparam.yaml 둘 다 영향):
+#   - scripts/compute_latent_stats.py 가 재매개변수화 z 기반으로 통계 산출.
+#   - training/train.py:_encode_to_latent 가 DiT에 sampled z 주입.
+#   기존 outputs/ldm_experiment_1 체크포인트는 μ-only 시절 코드로 학습됐고
+#   그 체크포인트의 embedded config로 동작하므로 영향 없음.
 
 # ── Data ──────────────────────────────────────────────────────────
 data:
@@ -26,12 +38,12 @@ vae:
   kl_weight: 1.0e-6        # 약한 KL — LDM/SD 관례. 키우면 posterior collapse 위험
   grad_weight: 0.0         # spatial gradient 재구성 보조항 (0 = off)
   logvar_clip: [-30.0, 20.0]
-  checkpoint: 'outputs/vae/vae_best.pt'   # diffusion 학습이 frozen으로 로드
+  checkpoint: 'outputs/vae/vae_best.pt'   # 기존 VAE 그대로 사용
   training:                # Stage 0 학습 하이퍼파라미터
     epochs: 500            # 충분한 수렴을 위해 길게
     lr: 1.0e-4
     weight_decay: 0.0
-    batch_size: 128
+    batch_size: 64
     num_workers: 4
     grad_clip: 1.0
     checkpoint_every: 10
@@ -40,7 +52,7 @@ vae:
 # ── Latent 정규화 — VAE 학습 후 사후 통계 (§2.2) ───────────────────
 latent_norm:
   mode: channel_pixelwise        # {channel_pixelwise, channelwise}
-  stats_path: 'outputs/vae/latent_stats.pt'
+  stats_path: 'outputs/vae/latent_stats_reparam.pt'   # ★ μ-only 버전과 분리
 
 # ── Condition Encoder (§2.3) ──────────────────────────────────────
 encoder:
@@ -70,18 +82,17 @@ dual_head:
 
 # ── Sampling (§4) ─────────────────────────────────────────────────
 sampling:
-  past_num_steps: 50             # DDPM_past 추론 denoising step (past_sampling_steps_train과 일치 — §3.3 OOD 방지)
-  main_num_steps: 200            # DDPM_main 추론 denoising step (main은 학습 시 롤아웃 없음 — step 수 자유)
-  past_sampling_steps_train: 50  # 학습 시 past 샘플링 step (past_num_steps와 일치 — OOD 방지)
+  num_steps: 50                  # 추론 denoising step N
+  past_sampling_steps_train: 50  # 학습 시 past 샘플링 step (추론과 일치 — OOD 방지)
   past_sample_cache: false       # past 생성물 캐싱 (학습 비용 완화 옵션)
 
 # ── Training — Stage 1~3 diffusion 학습 ───────────────────────────
 # batch_size는 *per-process* (DDP 각 GPU당) 크기.
 training:
-  batch_size: 32      # per-process (DDP 각 GPU당). 4-GPU → 글로벌 512
+  batch_size: 32       # per-process (DDP 각 GPU당). 4-GPU → 글로벌 128
   lr: 1.0e-4
   weight_decay: 1.0e-5
-  total_epochs: 200ß
+  total_epochs: 200
   num_workers: 4
   grad_clip: 1.0
   loss: heteroscedastic_nll

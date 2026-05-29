@@ -3,7 +3,7 @@ deepspeed_config: {}
 distributed_type: MULTI_GPU
 downcast_bf16: 'no'
 fsdp_config: {}
-gpu_ids: 'all'
+gpu_ids: '0,1,2,3'
 machine_rank: 0
 main_process_ip: null
 main_process_port: null
