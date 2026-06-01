@@ -26,18 +26,18 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 
-from dataset.era5_dataset import ERA5PairDataset
+from dataset.era5_dataset import ERA5FrameDataset
 from models.vae import build_vae, weather_vae_loss
 
 
 def _build_dataloaders(config: dict) -> tuple[DataLoader, DataLoader]:
     data_cfg = config["data"]
     vt = config["vae"]["training"]
-    train_ds = ERA5PairDataset(
+    train_ds = ERA5FrameDataset(
         normalized_path=data_cfg["normalized_path"],
         split="train", load_into_memory=True,
     )
-    val_ds = ERA5PairDataset(
+    val_ds = ERA5FrameDataset(
         normalized_path=data_cfg["normalized_path"],
         split="validation", load_into_memory=True,
     )
@@ -65,16 +65,16 @@ def _validate(
     device = accelerator.device
     local_sum = torch.zeros((), device=device)
     local_n = torch.zeros((), device=device)
-    for i, pair in enumerate(val_loader):
+    for i, frame in enumerate(val_loader):
         if i >= max_batches:
             break
         # validation은 posterior mean으로 deterministic 재구성 평가
-        recon, mu, log_var = vae(pair, sample=False)
+        recon, mu, log_var = vae(frame, sample=False)
         loss, _ = weather_vae_loss(
-            recon, pair, mu, log_var, kl_weight, grad_weight
+            recon, frame, mu, log_var, kl_weight, grad_weight
         )
-        local_sum += loss.detach() * pair.shape[0]
-        local_n += pair.shape[0]
+        local_sum += loss.detach() * frame.shape[0]
+        local_n += frame.shape[0]
     totals = accelerator.reduce(
         torch.stack([local_sum, local_n]), reduction="sum"
     )
@@ -124,8 +124,8 @@ def main(config: dict, output_dir: str, resume: bool = False) -> None:
     )
     train_loader, val_loader = _build_dataloaders(config)
     accelerator.print(
-        f"[info] VAE Stage 0 — train_pairs={len(train_loader.dataset)} "
-        f"val_pairs={len(val_loader.dataset)}"
+        f"[info] VAE Stage 0 (per-frame) — train_frames={len(train_loader.dataset)} "
+        f"val_frames={len(val_loader.dataset)}"
     )
 
     start_epoch = 0
@@ -151,10 +151,10 @@ def main(config: dict, output_dir: str, resume: bool = False) -> None:
     for epoch in range(start_epoch, epochs):
         running = {"vae_total": 0.0, "recon": 0.0, "kl": 0.0, "n": 0}
         t0 = time.time()
-        for it, pair in enumerate(train_loader):
-            recon, mu, log_var = vae(pair, sample=True)
+        for it, frame in enumerate(train_loader):
+            recon, mu, log_var = vae(frame, sample=True)
             loss, logs = weather_vae_loss(
-                recon, pair, mu, log_var, kl_weight, grad_weight
+                recon, frame, mu, log_var, kl_weight, grad_weight
             )
             optimizer.zero_grad(set_to_none=True)
             accelerator.backward(loss)

@@ -20,7 +20,7 @@ data:
   variables: ['t', 'u', 'v']     # temperature, u-wind, v-wind
   n_channels: 3                  # C
   spatial: [64, 64]              # H x W (한반도 patch)
-  target_frames: 2               # DDPM 1회가 예측하는 프레임 수
+  target_frames: 2               # 비대칭: DDPM_past=2(x_{t-1},x_{t+1}), DDPM_main=1(x_t). 코드 직접 미사용
   time_step_hours: 6
 
   splits:
@@ -28,10 +28,10 @@ data:
     validation: ['2020-01-01', '2021-12-31']
     test:       ['2022-01-01', '2022-12-31']
 
-# ── VAE — Stage 0에서 별도 선학습 후 freeze (§2.1) ─────────────────
+# ── VAE — 프레임별 단일 VAE. Stage 0에서 별도 선학습 후 freeze (§2.1) ──
 vae:
-  in_channels: 6           # = target_frames × n_channels
-  latent_channels: 12      # C_z = 2 × in_channels (총 8배 압축)
+  in_channels: 3           # 단일 프레임 = n_channels (C)
+  latent_channels: 6       # per-frame C_z = 2 × in_channels (총 8배 압축)
   latent_spatial: [16, 16] # H_z × W_z (64 → 16, ×4 downsample)
   base_channels: 128       # encoder/decoder base width
   ch_mult: [1, 2]          # level별 채널 배수 (len = downsample 횟수)
@@ -54,14 +54,17 @@ latent_norm:
   mode: channel_pixelwise        # {channel_pixelwise, channelwise}
   stats_path: 'outputs/vae/latent_stats_reparam.pt'   # ★ μ-only 버전과 분리
 
-# ── Condition Encoder (§2.3) ──────────────────────────────────────
+# ── Condition Encoder — 프레임별 2D conv (§2.3) ───────────────────
+# past cond=x_t(1프레임)→256토큰, main cond=[x̂_{t-1},x̂_{t+1}](2프레임)→512토큰(+time emb).
 encoder:
-  hidden_channels: 64      # C' (Conv3d 출력 채널)
+  hidden_channels: 64      # C' (2D conv 출력 채널)
   num_layers: 2
-  patch_size: 4            # 64 → 16 토큰 격자 (256 토큰)
+  patch_size: 4            # 64 → 16 토큰 격자 (프레임당 256 토큰)
   token_dim: 384           # D — dit.token_dim과 반드시 일치
 
 # ── DiT backbone + dual-head (§2.4) ───────────────────────────────
+# latent_channels는 config에 두지 않고 빌더가 vae.latent_channels에서 유도:
+#   DiT_past = 2×(=12, [ẑ_{t-1}‖ẑ_{t+1}]),  DiT_main = 1×(=6, ẑ_t).
 dit:
   token_dim: 384           # D
   depth: 4

@@ -1,26 +1,30 @@
 """v2 LDM/DiT — test set sub-sample (Mon/Wed/Fri)에 대한 N-member ensemble 생성.
 
-experiments/ensemble_inference.py (v1 픽셀 공간 dual-DDPM) 의 LDM 변환판.
-DDPM_main 의 x_t 예측을 평가하기 위한 latent 앙상블을 캐시한다.
+중심-프레임 복원형 Dual-DDPM. DDPM_main 의 x_t 복원을 평가하기 위한 latent 앙상블을
+캐시한다 (inference/sampling.py:generate_future_ensemble 와 동일 파이프라인).
 
-파이프라인 (inference/sampling.py:generate_future_ensemble 와 동일):
-    (x_{t-1}, x_t)  ──encoder──▶  cond_past
-        │ DDPM_past (inject_uncertainty=True)
+파이프라인:
+    x_t  ──encoder──▶  cond_past
+        │ DDPM_past (마지막 step만 logvar 주입)
         ▼
-    z_past ──VAE decode──▶ x̂_{t-2}
+    z_past(12ch) ──VAE decode──▶ [x̂_{t-1}, x̂_{t+1}]   (멤버별 다양)
         │
-    (x̂_{t-2}, x_{t-1})  ──encoder──▶  cond_main
-        │ DDPM_main (inject_uncertainty=False)
+    [x̂_{t-1}, x̂_{t+1}]  ──encoder──▶  cond_main
+        │ DDPM_main (주입 없음)
         ▼
-    z_main, log_var_main   ← 평가 대상
+    z_main(6ch), log_var_main   ← 평가 대상 = 복원된 x̂_t
 
 캐시 schema (sample_{idx:05d}.npz):
-    ensemble        (N, 12, 16, 16)  정규화 latent ẑ_0 앙상블 = z_main
-    log_var         (12, 16, 16)     latent dual-head log_var (멤버 평균)
-    x_t_true        (12, 16, 16)     GT [x_t, x_{t+1}] 블록의 latent 인코딩 (posterior μ)
-    ensemble_pixel  (N, 3, 64, 64)   디코딩된 x_t 픽셀 앙상블 (exp5 전용)
-    x_t_true_pixel  (3, 64, 64)      GT x_t 픽셀 필드 (exp5 전용)
-    time_t          str(timestamp)
+    ensemble            (N, 6, 16, 16)   정규화 latent ẑ_0 앙상블 = z_main (x̂_t)
+    log_var             (6, 16, 16)      latent dual-head log_var (멤버 평균)
+    x_t_true            (6, 16, 16)      GT x_t 의 latent 인코딩 (posterior μ)
+    ensemble_pixel      (N, 3, 64, 64)   디코딩된 x̂_t 픽셀 앙상블 (exp5/7/8)
+    x_t_true_pixel      (3, 64, 64)      GT x_t 픽셀 필드
+    ensemble_pixel_tm1  (N, 3, 64, 64)   DDPM_past 가 생성한 x̂_{t-1} 멤버 앙상블
+    ensemble_pixel_tp1  (N, 3, 64, 64)   DDPM_past 가 생성한 x̂_{t+1} 멤버 앙상블
+    x_tm1_true_pixel    (3, 64, 64)      GT x_{t-1} 픽셀 필드
+    x_tp1_true_pixel    (3, 64, 64)      GT x_{t+1} 픽셀 필드
+    time_t              str(timestamp)
 """
 from __future__ import annotations
 
@@ -34,7 +38,7 @@ import yaml
 from tqdm import tqdm
 
 from dataset.era5_dataset import ERA5NormalizedDataset
-from inference.sampling import LatentVDMSampler, _load_models
+from inference.sampling import LatentVDMSampler, _decode_pair, _load_models
 from models.schedule import VDMSchedule
 
 from .utils import ensure_dir
@@ -43,13 +47,19 @@ from .utils import ensure_dir
 def _maybe_accelerator():
     """accelerate가 launch한 multi-process 컨텍스트면 Accelerator를, 아니면 None.
 
-    accelerate 미설치/단일 process 일 경우 graceful fallback.
+    accelerate 미설치/단일 process 일 경우 graceful fallback. 끝 배리어에서
+    rank 별 추론 시간 편차로 NCCL 기본 타임아웃(10분)을 넘겨 죽는 일을 막기 위해
+    배리어 타임아웃을 4시간으로 늘린다 (training.train.run_infer 와 동일).
     """
     try:
+        from datetime import timedelta
+
         from accelerate import Accelerator
+        from accelerate.utils import InitProcessGroupKwargs
     except Exception:
         return None
-    return Accelerator()
+    init_kwargs = InitProcessGroupKwargs(timeout=timedelta(hours=4))
+    return Accelerator(kwargs_handlers=[init_kwargs])
 
 
 # latent dual-head log_var는 멤버별로 다를 수 있으나 (cond_main이 멤버별 past
@@ -66,9 +76,7 @@ def _select_mon_wed_fri_indices(times: np.ndarray) -> np.ndarray:
 
 @torch.no_grad()
 def _generate_main_ensemble(
-    x_tm1: torch.Tensor,
     x_t: torch.Tensor,
-    x_tp1: torch.Tensor,
     encoder,
     dit_past,
     dit_main,
@@ -79,50 +87,43 @@ def _generate_main_ensemble(
     device: torch.device,
     past_num_steps: int | None = None,
     main_num_steps: int | None = None,
-    inject_uncertainty_mode: str = "all",
+    inject_uncertainty_mode: str = "last",
 ) -> dict:
-    """단일 시점 입력 → DDPM_main 의 x_t latent 앙상블 + 진단 캐시.
+    """관측 x_t → DDPM_main 의 x̂_t latent 앙상블 + 진단 캐시.
 
     Args:
-        x_tm1, x_t, x_tp1: (1, C, H, W) 관측 3시점 (x_tp1은 GT latent 인코딩용).
+        x_t: (1, C, H, W) 관측 중심 프레임.
 
     Returns:
         dict — 캐시 키 (ensemble, log_var, x_t_true, ensemble_pixel,
-        x_t_true_pixel) 를 모두 cpu 텐서로 담는다.
+        x_t_true_pixel, ensemble_pixel_tm1, ensemble_pixel_tp1) 를 모두
+        cpu 텐서로 담는다. GT 이웃(x_{t±1})은 dataset 에서 직접 읽어 run_inference
+        에서 저장한다.
     """
     B = n_members
-    x_tm1 = x_tm1.to(device)
     x_t = x_t.to(device)
-    x_tp1 = x_tp1.to(device)
-    _, C, H, W = x_tm1.shape
-    C_z = vae.latent_channels
+    _, C, H, W = x_t.shape
+    cz = vae.latent_channels                                       # per-frame = 6
     H_z, W_z = normalizer.mu.shape[-2:]
 
-    # ── [1] DDPM_past: 다양한 과거 생성 (불확실성 주입) ────────────
-    cond_past = encoder(torch.stack([x_tm1, x_t], dim=1))          # (1, N_tok, D)
-    cond_past = cond_past.expand(B, -1, -1)                         # → (B, N_tok, D)
+    # ── [1] DDPM_past: 다양한 이웃 [x̂_{t-1}, x̂_{t+1}] 생성 ─────────
+    cond_past = encoder(x_t.unsqueeze(1))                          # (1, 256, D), F=1
+    cond_past = cond_past.expand(B, -1, -1)                        # → (B, 256, D)
     z_past, _ = sampler.sample(
-        dit_past, cond_past, (B, C_z, H_z, W_z), device,
+        dit_past, cond_past, (B, 2 * cz, H_z, W_z), device,
         inject_uncertainty_mode=inject_uncertainty_mode,
         num_steps=past_num_steps,
     )
-    # latent → 기상장: denormalize → decode
-    x_past = vae.decode(normalizer.denormalize(z_past))            # (B, 2C, H, W)
-    x_past = x_past.reshape(B, 2, C, H, W)
-    x_tm2_hat = x_past[:, 1]                                       # x̂_{t-2}
+    x_tm1_hat, x_tp1_hat = _decode_pair(vae, normalizer, z_past)   # 각 (B, C, H, W)
 
-    # ── [2] DDPM_main: future 생성 (불확실성 주입 없음) ────────────
-    x_tm1_B = x_tm1.expand(B, -1, -1, -1)
-    cond_main = encoder(torch.stack([x_tm2_hat, x_tm1_B], dim=1))
+    # ── [2] DDPM_main: x̂_t 복원 (불확실성 주입 없음) ──────────────
+    cond_main = encoder(torch.stack([x_tm1_hat, x_tp1_hat], dim=1))  # (B, 512, D), F=2
     z_main, lv_main = sampler.sample(
-        dit_main, cond_main, (B, C_z, H_z, W_z), device,
+        dit_main, cond_main, (B, cz, H_z, W_z), device,
         inject_uncertainty=False,
         num_steps=main_num_steps,
     )
-    # main 픽셀 앙상블: decode → frame 0 (= x_t)
-    x_main = vae.decode(normalizer.denormalize(z_main))            # (B, 2C, H, W)
-    x_main = x_main.reshape(B, 2, C, H, W)
-    ensemble_pixel = x_main[:, 0]                                  # (B, C, H, W)
+    ensemble_pixel = vae.decode(normalizer.denormalize(z_main))    # (B, C, H, W) = x̂_t
 
     # log_var 멤버 reduce
     if _LOG_VAR_MEMBER_REDUCE == "mean":
@@ -130,9 +131,8 @@ def _generate_main_ensemble(
     else:
         log_var = lv_main[0]
 
-    # GT [x_t, x_{t+1}] 블록의 latent 인코딩 (posterior μ, 샘플 아님)
-    gt_pair = torch.cat([x_t, x_tp1], dim=1)                       # (1, 2C, H, W)
-    mu_gt, _ = vae.encode(gt_pair)                                 # (1, C_z, H_z, W_z)
+    # GT x_t 의 latent 인코딩 (posterior μ, 샘플 아님)
+    mu_gt, _ = vae.encode(x_t)                                    # (1, C_z, H_z, W_z)
     x_t_true = normalizer.normalize(mu_gt)[0]                      # (C_z, H_z, W_z)
 
     return {
@@ -141,6 +141,9 @@ def _generate_main_ensemble(
         "x_t_true": x_t_true.detach().cpu(),
         "ensemble_pixel": ensemble_pixel.detach().cpu(),
         "x_t_true_pixel": x_t[0].detach().cpu(),
+        # DDPM_past 가 멤버별로 생성한 이웃 프레임 (mode=last 주입) — exp 신규 분석용.
+        "ensemble_pixel_tm1": x_tm1_hat.detach().cpu(),    # (B, C, H, W) = x̂_{t-1}
+        "ensemble_pixel_tp1": x_tp1_hat.detach().cpu(),    # (B, C, H, W) = x̂_{t+1}
     }
 
 
@@ -202,7 +205,7 @@ def run_inference(
         main_num_steps = int(samp_cfg.get("main_num_steps", _default_steps))
     sampler = LatentVDMSampler(schedule, num_steps=past_num_steps)
 
-    # mode='train': x_tp1 가용 → GT [x_t, x_{t+1}] 블록 latent 인코딩에 사용.
+    # 3시점 윈도우(x_{t-1}, x_t, x_{t+1}) 반환 — 여기선 관측 x_t 만 사용.
     ds = ERA5NormalizedDataset(
         normalized_path=config["data"]["normalized_path"],
         mode="train",
@@ -246,13 +249,11 @@ def run_inference(
     )
     for save_idx, idx in pbar:
         sample = ds[int(idx)]
-        x_tm1 = sample["x_tm1"].unsqueeze(0)
         x_t = sample["x_t"].unsqueeze(0)
-        x_tp1 = sample["x_tp1"].unsqueeze(0)
         time_t = sample["time_t"]
 
         cache = _generate_main_ensemble(
-            x_tm1, x_t, x_tp1, encoder, dit_past, dit_main, vae, normalizer,
+            x_t, encoder, dit_past, dit_main, vae, normalizer,
             sampler, n_members=n_members, device=device,
             past_num_steps=past_num_steps, main_num_steps=main_num_steps,
             inject_uncertainty_mode=inject_uncertainty_mode,
@@ -266,6 +267,10 @@ def run_inference(
             x_t_true=cache["x_t_true"].numpy().astype(np.float32),
             ensemble_pixel=cache["ensemble_pixel"].numpy().astype(np.float32),
             x_t_true_pixel=cache["x_t_true_pixel"].numpy().astype(np.float32),
+            ensemble_pixel_tm1=cache["ensemble_pixel_tm1"].numpy().astype(np.float32),
+            ensemble_pixel_tp1=cache["ensemble_pixel_tp1"].numpy().astype(np.float32),
+            x_tm1_true_pixel=sample["x_tm1"].numpy().astype(np.float32),
+            x_tp1_true_pixel=sample["x_tp1"].numpy().astype(np.float32),
             time_t=np.array(str(time_t)),
         )
 
@@ -292,10 +297,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=None,
                    help="디버깅용: 처음 N개 시점만 생성")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--inject_uncertainty_mode", default="all",
+    p.add_argument("--inject_uncertainty_mode", default="last",
                    choices=["all", "last", "none"],
                    help="DDPM_past 의 dual-head log_var 노이즈 주입 schedule. "
-                        "'all'(매 step, 기본) / 'last'(마지막 step만) / 'none'.")
+                        "'last'(마지막 step만, 기본·학습과 일치) / 'all' / 'none'.")
     return p.parse_args()
 
 

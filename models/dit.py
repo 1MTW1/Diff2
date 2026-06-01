@@ -207,13 +207,20 @@ class DualHeadDiT(nn.Module):
         return eps_pred, log_var
 
 
-def build_dit(config: dict) -> DualHeadDiT:
-    """config dict로부터 DualHeadDiT 생성 (학습/추론 공통)."""
+def build_dit(config: dict, latent_channels: int | None = None) -> DualHeadDiT:
+    """config dict로부터 DualHeadDiT 생성 (학습/추론 공통).
+
+    `latent_channels`로 채널 수를 override한다 — 새 구조에서 DiT_past는
+    `2×vae.latent_channels`(=12, [ẑ_{t-1}‖ẑ_{t+1}]), DiT_main은 `1×`(=6, ẑ_t).
+    None이면 config의 per-frame 값(vae.latent_channels)을 그대로 쓴다.
+    """
     vae_cfg = config["vae"]
     dit_cfg = config["dit"]
     head_cfg = config["dual_head"]
+    if latent_channels is None:
+        latent_channels = int(vae_cfg["latent_channels"])
     return DualHeadDiT(
-        latent_channels=int(vae_cfg["latent_channels"]),
+        latent_channels=int(latent_channels),
         latent_size=tuple(vae_cfg["latent_spatial"]),
         token_dim=int(dit_cfg["token_dim"]),
         depth=int(dit_cfg["depth"]),

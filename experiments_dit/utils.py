@@ -1,7 +1,7 @@
 """experiments_dit용 공용 유틸: latent 캐시 I/O, denormalize, plot helper.
 
-experiments/utils.py 의 v2 LDM/DiT 판. 캐시는 latent 공간 (C_z=12, 16×16)으로
-저장되며, exp5 전용으로 디코딩된 픽셀 필드(`ensemble_pixel`, `x_t_true_pixel`)도
+experiments/utils.py 의 v2 LDM/DiT 판. 캐시는 프레임별 latent 공간 (C_z=6, 16×16)으로
+저장되며 (x̂_t latent), 디코딩된 픽셀 필드(`ensemble_pixel`=x̂_t, `x_t_true_pixel`=GT x_t)도
 함께 들어 있을 수 있다. `EnsembleSample`은 추가 픽셀 키를 optional 필드로
 보유하고, npz에 없으면 `None`으로 둔다.
 """
@@ -26,19 +26,34 @@ V_IDX = 2
 # latent 공간 분석에서 대표로 사용하는 latent 채널 (v1의 TEMP_IDX에 대응).
 LATENT_CH = 0
 
+# ── 픽셀 그리드 좌표 (data/era5_normalized.zarr) ──────────────────────
+#   lat: 69 → 6 °N (index 0..63, step −1°),  lon: 95 → 158 °E (step +1°)
+# 한반도 박스 (lat 43→33°N, lon 124→132°E) = 11×9 — exp7/aavg 공용.
+KOREA_LAT_SLICE = slice(26, 37)
+KOREA_LON_SLICE = slice(29, 38)
+# Seoul (37.56°N, 127°E) 최근접 픽셀 = (lat_idx 31, lon_idx 32) 중심 3×3.
+SEOUL_LAT_IDX = 31
+SEOUL_LON_IDX = 32
+SEOUL_LAT_SLICE = slice(SEOUL_LAT_IDX - 1, SEOUL_LAT_IDX + 2)   # 39,38,37 °N
+SEOUL_LON_SLICE = slice(SEOUL_LON_IDX - 1, SEOUL_LON_IDX + 2)   # 126,127,128 °E
+
 
 @dataclass
 class EnsembleSample:
     """단일 시점의 latent ensemble 캐시 데이터.
 
     Attributes:
-        ensemble:        (N, C_z, H_z, W_z) 정규화 latent ẑ_0 앙상블
+        ensemble:        (N, C_z, H_z, W_z) 정규화 latent ẑ_0 앙상블 (x̂_t, C_z=6)
         log_var:         (C_z, H_z, W_z) latent dual-head log_var (멤버 평균)
-        x_t_true:        (C_z, H_z, W_z) GT frame-pair의 latent 인코딩 (posterior μ)
+        x_t_true:        (C_z, H_z, W_z) GT x_t 의 latent 인코딩 (posterior μ)
         time_t:          numpy.datetime64 scalar
         path:            원본 npz 경로
-        ensemble_pixel:  (N, C, H, W) 디코딩된 픽셀 앙상블 (exp5 전용; 없으면 None)
-        x_t_true_pixel:  (C, H, W) GT 픽셀 필드 (exp5 전용; 없으면 None)
+        ensemble_pixel:  (N, C, H, W) 디코딩된 x̂_t 픽셀 앙상블 (없으면 None)
+        x_t_true_pixel:  (C, H, W) GT x_t 픽셀 필드 (없으면 None)
+        ensemble_pixel_tm1: (N, C, H, W) DDPM_past 생성 x̂_{t-1} 멤버 앙상블 (없으면 None)
+        ensemble_pixel_tp1: (N, C, H, W) DDPM_past 생성 x̂_{t+1} 멤버 앙상블 (없으면 None)
+        x_tm1_true_pixel: (C, H, W) GT x_{t-1} 픽셀 필드 (없으면 None)
+        x_tp1_true_pixel: (C, H, W) GT x_{t+1} 픽셀 필드 (없으면 None)
     """
     ensemble: np.ndarray
     log_var: np.ndarray
@@ -47,6 +62,10 @@ class EnsembleSample:
     path: Path
     ensemble_pixel: Optional[np.ndarray] = None
     x_t_true_pixel: Optional[np.ndarray] = None
+    ensemble_pixel_tm1: Optional[np.ndarray] = None
+    ensemble_pixel_tp1: Optional[np.ndarray] = None
+    x_tm1_true_pixel: Optional[np.ndarray] = None
+    x_tp1_true_pixel: Optional[np.ndarray] = None
 
 
 def load_ensemble_npz(path: Path | str) -> EnsembleSample:
@@ -61,6 +80,10 @@ def load_ensemble_npz(path: Path | str) -> EnsembleSample:
         data["x_t_true_pixel"].astype(np.float32)
         if "x_t_true_pixel" in keys else None
     )
+
+    def _opt(key: str) -> Optional[np.ndarray]:
+        return data[key].astype(np.float32) if key in keys else None
+
     return EnsembleSample(
         ensemble=data["ensemble"].astype(np.float32),
         log_var=data["log_var"].astype(np.float32),
@@ -69,6 +92,10 @@ def load_ensemble_npz(path: Path | str) -> EnsembleSample:
         path=path,
         ensemble_pixel=ensemble_pixel,
         x_t_true_pixel=x_t_true_pixel,
+        ensemble_pixel_tm1=_opt("ensemble_pixel_tm1"),
+        ensemble_pixel_tp1=_opt("ensemble_pixel_tp1"),
+        x_tm1_true_pixel=_opt("x_tm1_true_pixel"),
+        x_tp1_true_pixel=_opt("x_tp1_true_pixel"),
     )
 
 

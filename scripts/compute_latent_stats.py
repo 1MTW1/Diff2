@@ -1,11 +1,11 @@
 """Latent 통계 측정 — instruction_v2 §2.2 / Stage 0 후처리.
 
-frozen VAE로 학습 split의 모든 연속 2시점 쌍을 encode하여 **결정론적**
+frozen 프레임별 VAE로 학습 split의 모든 개별 프레임을 encode하여 **결정론적**
 latent z = μ 의 1·2차 모멘트를 측정하고 `latent_stats.pt`로 저장한다. 이후 모든
-diffusion 학습/추론은 이 통계로 latent를 평균0/분산1로 정규화한다.
+diffusion 학습/추론은 이 통계로 (프레임별 6채널) latent를 평균0/분산1로 정규화한다.
 
 VAE를 deterministic autoencoder처럼 사용하므로 z=μ 로 통계를 낸다 (노이즈 없음).
-train.py `_encode_to_latent` 가 z=μ 로 인코딩하는 것과 **반드시 정합**해야 정규화가
+train.py `_encode_frame` 이 z=μ 로 인코딩하는 것과 **반드시 정합**해야 정규화가
 평균0/분산1을 만족한다 (한쪽만 노이즈를 섞으면 분산<1). `--seed` 는 더 이상 통계에
 영향 없음 — 무작위성이 제거됨.
 
@@ -27,7 +27,7 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset.era5_dataset import ERA5PairDataset
+from dataset.era5_dataset import ERA5FrameDataset
 from models.vae import build_vae
 
 
@@ -41,7 +41,7 @@ def compute_stats(
 ) -> dict:
     """결정론적 latent z = μ 의 1·2차 모멘트 streaming 계산 (autoencoder 방식).
 
-    train.py `_encode_to_latent` 와 동일하게 z=μ 만 사용한다. pixelwise stats는
+    train.py `_encode_frame` 과 동일하게 z=μ 만 사용한다. pixelwise stats는
     Var(μ) 만 포함한다 (재매개변수화 노이즈 항 E[exp(logσ²)] 없음).
     """
     torch.manual_seed(seed)                  # ε 재현성
@@ -49,9 +49,9 @@ def compute_stats(
     sumsq_chw: torch.Tensor | None = None    # Σ z²
     count = 0                                # 누적 sample 수
 
-    for pair in tqdm(loader, desc="encode"):
-        pair = pair.to(device)               # (B, 6, 64, 64)
-        mu, _ = vae.encode(pair)             # (B, C_z, H_z, W_z)
+    for frame in tqdm(loader, desc="encode"):
+        frame = frame.to(device)             # (B, 3, 64, 64)
+        mu, _ = vae.encode(frame)            # (B, C_z, H_z, W_z)
         # deterministic autoencoder: z = μ (노이즈 샘플링 없음 — train.py와 정합)
         z = mu.float()
         if sum_chw is None:
@@ -121,8 +121,8 @@ def main() -> None:
     for param in vae.parameters():
         param.requires_grad = False
 
-    # ── 학습 split의 모든 연속 2시점 쌍 ────────────────────────────
-    ds = ERA5PairDataset(
+    # ── 학습 split의 모든 개별 프레임 ──────────────────────────────
+    ds = ERA5FrameDataset(
         normalized_path=config["data"]["normalized_path"],
         split="train",
         load_into_memory=False,
@@ -131,7 +131,7 @@ def main() -> None:
         ds, batch_size=args.batch_size, shuffle=False,
         num_workers=4, pin_memory=True,
     )
-    print(f"[info] encoding {len(ds)} pairs, mode={mode}")
+    print(f"[info] encoding {len(ds)} frames, mode={mode}")
 
     stats = compute_stats(vae, loader, device, mode, seed=args.seed)
     torch.save(stats, out_path)

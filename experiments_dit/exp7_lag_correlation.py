@@ -119,7 +119,7 @@ def _compute_all(
             base = _get(t)
             tgt  = _get(t + off)
             r_gt[i] = _spatial_pearson(base["gt_u"],   tgt["gt_t"])
-            r_a [i] = _spatial_pearson(base["mem_u`"][member_a],
+            r_a [i] = _spatial_pearson(base["mem_u"][member_a],
                                        tgt["mem_t"][member_a])
             r_b [i] = _spatial_pearson(base["mem_u"][member_b],
                                        tgt["mem_t"][member_b])

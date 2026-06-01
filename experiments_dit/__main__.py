@@ -25,6 +25,8 @@ _EXPERIMENTS: list[tuple[str, bool]] = [
     ("exp6_pixel_ratio", True),
     ("exp7_lag_correlation", True),
     ("exp8_pixel_lag_correlation", True),
+    ("exp9_aavg_spread", True),
+    ("exp10_neighbor_corr", True),
 ]
 
 

@@ -1,9 +1,15 @@
 """실험 5 (v2 LDM/DiT): composite map (quiver + shading) — 픽셀 공간.
 
-6 experiment 중 유일하게 **픽셀 공간**에서 그려진다. latent 캐시가 아닌 디코딩된
-픽셀 필드(`ensemble_pixel`, `x_t_true_pixel`)를 사용하여 GT + 14 멤버의
-diff-from-mean + ensemble mean 의 4×4 (16-panel) composite map 과 spread map 을
-그린다. 픽셀 필드는 물리 단위(K)로 역정규화된다 (`_denorm_field`).
+세 lead (t-1, t, t+1) 각각에 대해, n_samples 개의 시점에서 4×4(16-panel)
+composite map 을 그린다 (lead × sample 당 1 그림):
+    - panel 0      : GT (절대 T 음영 + GT 바람 quiver)
+    - panel 1..14  : GT − member_k (T 차이 음영 + (GT−member) 바람 차이 quiver)
+    - panel 15     : ensemble mean (절대 T 음영 + 평균 바람 quiver)
+공유 colorbar 2개:
+    - 절대(panel 0·15) : {GT_T, mean_T} 의 (min, max)
+    - 차이(panel 1..14): 모든 (GT_T − member_T) 의 (min, max)   ← literal min/max
+픽셀 필드는 물리 단위로 역정규화된다. 이웃(t±1)은 t±6h 의 시각별 통계를 쓴다.
+입력 캐시는 이웃 저장 버전 ensemble_inference 로 생성해야 한다.
 """
 from __future__ import annotations
 
@@ -25,6 +31,14 @@ _QUIVER_STRIDE = 8           # 64/8 = 8 arrows per side
 _QUIVER_SCALE = 400.0        # m/s per axis-width; ↑ 클수록 화살표 짧음
 _QUIVER_CLIP_MAG = 60.0      # m/s, 시각화용 magnitude cap
 _QUIVER_KEY_MAGNITUDE = 20.0  # m/s, 화살표 길이 reference
+
+_N_MEMBERS_SHOWN = 14        # panel 1..14
+# (라벨, 파일명 토큰, 멤버 픽셀 키, GT 픽셀 키, 중심으로부터 시간 오프셋[h])
+_LEADS = [
+    ("t-1", "tm1", "ensemble_pixel_tm1", "x_tm1_true_pixel", -6),
+    ("t",   "t",   "ensemble_pixel",     "x_t_true_pixel",    0),
+    ("t+1", "tp1", "ensemble_pixel_tp1", "x_tp1_true_pixel",  6),
+]
 
 
 def _denorm_field(
@@ -78,28 +92,31 @@ def _plot_one_panel(ax, temp, u, v, vmin, vmax, title, cmap="RdBu_r"):
 def _save_composite(
     sample: dict, out_path: Path,
 ) -> None:
-    """16 panel: GT(abs) + 14 members(diff from mean) + ensemble mean(abs)."""
+    """16 panel: GT(abs) + 14×(GT − member)(diff) + ensemble mean(abs).
+
+    sample: {gt (C,H,W), members (≥14,C,H,W), mean (C,H,W), time_t, lead}.
+    음영=T, quiver=바람. diff panel 의 quiver 는 (GT − member) 바람 차이.
+    """
     fig, axes = plt.subplots(4, 4, figsize=(17, 16))
     flat = axes.flatten()
 
     gt = sample["gt"]                                  # (C, H, W)
-    members = sample["members"]                        # (14, C, H, W)
+    members = sample["members"][:_N_MEMBERS_SHOWN]     # (14, C, H, W)
     mean_field = sample["mean"]                        # (C, H, W)
+    lead = sample["lead"]
 
-    # ── 색범위 ────────────────────────────────────────────────────
+    # ── 색범위 (명시 spec: literal min/max) ───────────────────────
     abs_pool = np.concatenate(
         [gt[TEMP_IDX].flatten(), mean_field[TEMP_IDX].flatten()]
     )
-    abs_vmin = float(np.percentile(abs_pool, 1))
-    abs_vmax = float(np.percentile(abs_pool, 99))
+    abs_vmin, abs_vmax = float(abs_pool.min()), float(abs_pool.max())
 
-    diff_pool = (members[:, TEMP_IDX] - mean_field[TEMP_IDX]).flatten()
-    diff_max = float(np.percentile(np.abs(diff_pool), 99))
-    diff_max = max(diff_max, 1e-6)
+    diff_pool = (gt[TEMP_IDX] - members[:, TEMP_IDX]).flatten()
+    diff_vmin, diff_vmax = float(diff_pool.min()), float(diff_pool.max())
+    if diff_vmin == diff_vmax:                         # degenerate guard
+        diff_vmin, diff_vmax = diff_vmin - 1e-6, diff_vmax + 1e-6
 
-    im_abs = None
-    im_diff = None
-    last_q = None
+    im_abs = im_diff = last_q = None
 
     # 0: GT (절대)
     im_abs, last_q = _plot_one_panel(
@@ -107,14 +124,15 @@ def _save_composite(
         gt[TEMP_IDX], gt[U_IDX], gt[V_IDX],
         abs_vmin, abs_vmax, "Ground Truth", cmap="RdBu_r",
     )
-    # 1..14: members (diff = member − mean)
-    for k in range(14):
+    # 1..14: GT − member_k  (음영=T 차이, quiver=바람 차이)
+    for k in range(_N_MEMBERS_SHOWN):
         m = members[k]
-        diff_t = m[TEMP_IDX] - mean_field[TEMP_IDX]
+        diff_t = gt[TEMP_IDX] - m[TEMP_IDX]
+        du, dv = gt[U_IDX] - m[U_IDX], gt[V_IDX] - m[V_IDX]
         im_diff, last_q = _plot_one_panel(
             flat[1 + k],
-            diff_t, m[U_IDX], m[V_IDX],
-            -diff_max, diff_max, f"Member {k + 1} − Mean", cmap="RdBu_r",
+            diff_t, du, dv,
+            diff_vmin, diff_vmax, f"GT − Member {k + 1}", cmap="RdBu_r",
         )
     # 15: ensemble mean (절대)
     im_abs, last_q = _plot_one_panel(
@@ -124,7 +142,7 @@ def _save_composite(
     )
 
     fig.suptitle(
-        f"Exp5 composite — "
+        f"Exp5 composite — lead {lead}  ·  "
         f"{pd.Timestamp(sample['time_t']).strftime('%Y-%m-%d %H:%M')}",
         y=0.98, fontsize=13,
     )
@@ -141,7 +159,7 @@ def _save_composite(
 
     cax_diff = fig.add_axes([0.88, 0.12, 0.020, 0.34])
     cb_diff = fig.colorbar(im_diff, cax=cax_diff)
-    cb_diff.set_label("member − mean  (K)")
+    cb_diff.set_label("GT − member  (K)")
 
     # quiver key (figure 좌하단)
     if last_q is not None:
@@ -201,36 +219,43 @@ def run_exp5(
     chosen = []
     for k, idx in enumerate(picks, start=1):
         es = load_ensemble_npz(files[idx])
-        if es.ensemble_pixel is None or es.x_t_true_pixel is None:
-            raise KeyError(
-                f"{files[idx]} 에 픽셀 캐시 (ensemble_pixel/x_t_true_pixel) 가 "
-                f"없습니다 — experiments_dit.ensemble_inference 로 생성하세요."
+        for lead, tok, mem_key, gt_key, off_h in _LEADS:
+            mem_norm = getattr(es, mem_key)
+            gt_norm = getattr(es, gt_key)
+            if mem_norm is None or gt_norm is None:
+                raise KeyError(
+                    f"{files[idx]} 에 '{mem_key}'/'{gt_key}' 가 없습니다 — 이웃 저장 "
+                    f"버전 experiments_dit.ensemble_inference 로 캐시를 재생성하세요."
+                )
+            lead_time = es.time_t + np.timedelta64(off_h, "h")
+            gt_d = _denorm_field(gt_norm, lead_time, mean, std)        # (C,H,W)
+            members_d = _denorm_field(mem_norm, lead_time, mean, std)  # (N,C,H,W)
+            mean_d = members_d.mean(axis=0)                            # (C,H,W)
+
+            sample = {
+                "gt": gt_d,
+                "members": members_d,
+                "mean": mean_d,
+                "time_t": lead_time,
+                "lead": lead,
+            }
+            _save_composite(
+                sample, fig_dir / f"exp5_composite_sample{k}_{tok}.png",
             )
-        gt_d = _denorm_field(es.x_t_true_pixel, es.time_t, mean, std)     # (C,H,W)
-        members_d = _denorm_field(es.ensemble_pixel, es.time_t, mean, std)  # (N,C,H,W)
-        mean_d = members_d.mean(axis=0)                                   # (C,H,W)
 
-        sample = {
-            "gt": gt_d,
-            "members": members_d[:14],
-            "mean": mean_d,
-            "time_t": es.time_t,
-        }
-        _save_composite(sample, fig_dir / f"exp5_composite_sample{k}.png")
-
-        spread_norm = es.ensemble_pixel.std(axis=0, ddof=1)               # (C,H,W)
-        spread_d = _denorm_spread_field(spread_norm, es.time_t, std)
-        _save_spread(
-            spread_norm, spread_d, es.time_t,
-            fig_dir / f"exp5_spread_sample{k}.png",
-        )
+            spread_norm = mem_norm.std(axis=0, ddof=1)                 # (C,H,W)
+            spread_d = _denorm_spread_field(spread_norm, lead_time, std)
+            _save_spread(
+                spread_norm, spread_d, lead_time,
+                fig_dir / f"exp5_spread_sample{k}_{tok}.png",
+            )
         chosen.append({
             "idx": int(idx),
             "time_t": str(es.time_t),
             "file": str(files[idx]),
         })
 
-    print(f"[exp5] picked={chosen}")
+    print(f"[exp5] picked={chosen}  (×3 leads each)")
     return {"picked": chosen}
 
 

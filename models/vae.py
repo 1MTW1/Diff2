@@ -1,10 +1,13 @@
-"""WeatherVAE — 2시점 기상장 ↔ latent 변환 (instruction_v2 §2.1).
+"""WeatherVAE — 기상장 프레임 ↔ latent 변환 (instruction_v2 §2.1, 수정).
 
-(B, 6, 64, 64)  ──encode──▶  posterior (μ_z, logσ²_z), 각 (B, 12, 16, 16)
-(B, 12, 16, 16) ──decode──▶  (B, 6, 64, 64)
+새 구조는 **프레임별 단일 VAE**다 (2시점 동시 인코딩 아님):
+(B, 3, 64, 64)  ──encode──▶  posterior (μ_z, logσ²_z), 각 (B, 6, 16, 16)
+(B, 6, 16, 16)  ──decode──▶  (B, 3, 64, 64)
 
-공간 64→16 (×4 downsample), 채널 6→12 → 총 8배 압축.
-diffusion과 분리되어 Stage 0에서 개별 학습 후 freeze 된다.
+공간 64→16 (×4 downsample), 채널 3→6 → 총 8배 압축.
+DDPM_past 타깃 latent은 두 프레임(x_{t-1}, x_{t+1})을 각각 인코딩해 채널 concat한
+12채널, DDPM_main 타깃은 1프레임(x_t) 6채널. (이 결합은 호출부에서 처리.)
+diffusion과 분리되어 Stage 0에서 개별 학습 후 freeze 된다. time embedding 없음.
 KL은 매우 약하게 (압축기 역할; latent를 가우시안으로 강제하지 않음 — §2.1).
 """
 from __future__ import annotations
@@ -65,8 +68,8 @@ class WeatherVAE(nn.Module):
     """2시점 기상장용 KL-regularized autoencoder.
 
     Args:
-        in_channels:     입력 채널 (= target_frames × C, 기본 6)
-        latent_channels: latent 채널 C_z (기본 12)
+        in_channels:     입력 채널 (단일 프레임 = C, 기본 3)
+        latent_channels: per-frame latent 채널 C_z (기본 6)
         base_channels:   encoder/decoder base width
         ch_mult:         level별 채널 배수 (len == downsample 횟수)
         logvar_clip:     posterior logσ² clamp 범위 (수치 안정)
@@ -74,8 +77,8 @@ class WeatherVAE(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 6,
-        latent_channels: int = 12,
+        in_channels: int = 3,
+        latent_channels: int = 6,
         base_channels: int = 128,
         ch_mult: tuple[int, ...] = (1, 2),
         logvar_clip: tuple[float, float] = (-30.0, 20.0),

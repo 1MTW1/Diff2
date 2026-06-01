@@ -1,11 +1,11 @@
-"""Latent diffusion 추론 + 불확실성 주입 (instruction_v2 §4).
+"""Latent diffusion 추론 + 불확실성 주입 (instruction_v2 §4, 중심-프레임 복원형).
 
-모든 diffusion은 **latent 공간**에서 수행되고, VAE decode는 trajectory가 끝난 뒤
-**1회만** 한다. 앙상블 다양성은 DDPM_past 샘플링의 불확실성 주입(§4.1)에서
-발생하여 DDPM_main으로 전파된다.
+관측 x_t → DDPM_past가 멤버별로 다양한 이웃 [x̂_{t-1}, x̂_{t+1}]를 생성 →
+DDPM_main이 그 이웃들로부터 x̂_t를 복원. 앙상블 = {x̂_t} (중심 프레임의 불확실성).
+모든 diffusion은 **latent 공간**에서 수행되고, VAE decode는 trajectory가 끝난 뒤 한다.
 
 핵심 메커니즘 (§4.1) — **DDPM_past 전용**:
-    매 denoising step에서 dual-head의 log_var로부터 latent 공간에
+    **마지막 denoising step에서만** dual-head의 log_var로부터 latent 공간에
     `exp(0.5·log_var)·η` (η~N(0,I), latent 요소별 독립) 노이즈를 추가한다.
     이 독립 노이즈가 VAE decoder의 upsampling/conv를 거치며 공간 상관이 있는
     기상장 perturbation으로 복원된다 — 이것이 LDM 변환의 핵심 목적이다.
@@ -145,9 +145,20 @@ class LatentVDMSampler:
         return z, log_var
 
 
+def _decode_pair(
+    vae: torch.nn.Module,
+    normalizer: LatentNormalizer,
+    z: torch.Tensor,             # (B, 2·C_z, H_z, W_z)
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """past latent(12ch) → 채널 split → denorm → 프레임별 decode → (x̂_{t-1}, x̂_{t+1})."""
+    cz = z.shape[1] // 2
+    x0 = vae.decode(normalizer.denormalize(z[:, :cz]))
+    x1 = vae.decode(normalizer.denormalize(z[:, cz:]))
+    return x0, x1
+
+
 @torch.no_grad()
 def generate_future_ensemble(
-    x_tm1: torch.Tensor,
     x_t: torch.Tensor,
     encoder: torch.nn.Module,
     dit_past: torch.nn.Module,
@@ -160,65 +171,64 @@ def generate_future_ensemble(
     past_num_steps: int | None = None,
     main_num_steps: int | None = None,
 ) -> tuple[torch.Tensor, dict]:
-    """단일 관측 (x_{t-1}, x_t)에 대해 future 앙상블 생성 (batched).
+    """단일 관측 x_t에 대해 중심 프레임 x_t 앙상블 생성 (batched).
 
-    앙상블 차원을 batch dim에 펼쳐 sampler를 past 1회 + main 1회만 호출한다
-    (member별 noise/주입이 batch dim에서 독립이라 다양성 보존).
+    past가 멤버별로 다양한 이웃 [x̂_{t-1}, x̂_{t+1}]를 생성(마지막 step에서만 logvar 주입)
+    하고, main이 각 멤버를 x̂_t로 복원한다. 앙상블 다양성은 past의 불확실성 주입에서
+    발생해 main으로 전파된다. 앙상블 차원을 batch dim에 펼쳐 past 1회 + main 1회만 호출.
 
     Args:
-        x_tm1, x_t:     (1, C, H, W) 관측 2시점
+        x_t:            (1, C, H, W) 관측 중심 프레임
         past_num_steps: DDPM_past denoising step 수 (None이면 sampler 기본값)
         main_num_steps: DDPM_main denoising step 수 (None이면 sampler 기본값)
     Returns:
-        future: (ensemble_size, 2, C, H, W) — 예측 [x_t, x_{t+1}] 앙상블
-        diag:   진단용 dict (past/main log_var, past 생성물)
+        ensemble: (ensemble_size, 1, C, H, W) — 복원된 x̂_t 앙상블
+        diag:     진단용 dict (past/main log_var, 생성된 이웃)
     """
     B = ensemble_size
-    x_tm1 = x_tm1.to(device)
     x_t = x_t.to(device)
-    _, C, H, W = x_tm1.shape
-    C_z = vae.latent_channels
+    _, C, H, W = x_t.shape
+    cz = vae.latent_channels                                    # per-frame = 6
     H_z, W_z = normalizer.mu.shape[-2:]
 
-    # ── [1] DDPM_past: 다양한 과거 생성 (불확실성 주입) ────────────
-    # past condition = [x_{t-1}, x_t] (관측) — 모든 member 동일 → expand
-    cond_past = encoder(torch.stack([x_tm1, x_t], dim=1))        # (1, N_tok, D)
-    cond_past = cond_past.expand(B, -1, -1)                      # → (B, N_tok, D)
+    # ── [1] DDPM_past: 다양한 이웃 [x̂_{t-1}, x̂_{t+1}] 생성 ─────────
+    # past condition = x_t (관측) — 모든 member 동일 → expand
+    cond_past = encoder(x_t.unsqueeze(1))                       # (1, 256, D), F=1
+    cond_past = cond_past.expand(B, -1, -1)                     # → (B, 256, D)
     z_past, lv_past = sampler.sample(
-        dit_past, cond_past, (B, C_z, H_z, W_z), device,
-        inject_uncertainty=True,                                # past 전용
+        dit_past, cond_past, (B, 2 * cz, H_z, W_z), device,
+        inject_uncertainty_mode="last",                        # past 전용, 마지막 step만
         num_steps=past_num_steps,
     )
-    # latent → 기상장: denormalize → decode (trajectory 종료 후 1회)
-    x_past = vae.decode(normalizer.denormalize(z_past))         # (B, 2C, H, W)
-    x_past = x_past.reshape(B, 2, C, H, W)
-    x_tm2_hat = x_past[:, 1]      # 생성된 x̂_{t-2} (past target [x̂_{t-3}, x̂_{t-2}])
+    x_tm1_hat, x_tp1_hat = _decode_pair(vae, normalizer, z_past)   # 각 (B, C, H, W)
 
-    # ── [2] DDPM_main: future 생성 (불확실성 주입 없음) ────────────
-    # main condition = [x̂_{t-2}, x_{t-1}] — past 생성물 포함 (teacher forcing 금지)
-    x_tm1_B = x_tm1.expand(B, -1, -1, -1)
-    cond_main = encoder(torch.stack([x_tm2_hat, x_tm1_B], dim=1))
+    # ── [2] DDPM_main: x̂_t 복원 (불확실성 주입 없음) ──────────────
+    # main condition = [x̂_{t-1}, x̂_{t+1}] — 전부 past 생성물 (teacher forcing 금지)
+    cond_main = encoder(torch.stack([x_tm1_hat, x_tp1_hat], dim=1))  # (B, 512, D), F=2
     z_main, lv_main = sampler.sample(
-        dit_main, cond_main, (B, C_z, H_z, W_z), device,
-        inject_uncertainty=False,                               # main은 주입 안 함
+        dit_main, cond_main, (B, cz, H_z, W_z), device,
+        inject_uncertainty=False,                              # main은 주입 안 함
         num_steps=main_num_steps,
     )
-    x_main = vae.decode(normalizer.denormalize(z_main))         # (B, 2C, H, W)
-    future = x_main.reshape(B, 2, C, H, W)                      # [x_t, x_{t+1}]
+    x_t_hat = vae.decode(normalizer.denormalize(z_main))       # (B, C, H, W)
+    ensemble = x_t_hat.reshape(B, 1, C, H, W)                  # 복원된 x̂_t
 
-    return future, {
+    return ensemble, {
         "log_var_past": lv_past.detach().cpu(),
         "log_var_main": lv_main.detach().cpu(),
-        "x_past_gen": x_past.detach().cpu(),
+        "x_neighbors_gen": torch.stack(
+            [x_tm1_hat, x_tp1_hat], dim=1
+        ).detach().cpu(),                                      # (B, 2, C, H, W)
     }
 
 
 # ─── CLI ────────────────────────────────────────────────────────────
 def _load_models(config: dict, ckpt: dict, device: torch.device):
     """diffusion 체크포인트 + VAE 체크포인트 + latent 통계 로드."""
+    cz = int(config["vae"]["latent_channels"])                 # per-frame = 6
     encoder = build_encoder(config).to(device)
-    dit_past = build_dit(config).to(device)
-    dit_main = build_dit(config).to(device)
+    dit_past = build_dit(config, latent_channels=2 * cz).to(device)   # 12ch
+    dit_main = build_dit(config, latent_channels=cz).to(device)       # 6ch
     encoder.load_state_dict(ckpt["encoder"])
     dit_past.load_state_dict(ckpt["dit_past"])
     dit_main.load_state_dict(ckpt["dit_main"])
@@ -281,18 +291,18 @@ def main() -> None:
     results = []
     for i in tqdm(range(n_samples), desc="ensemble"):
         sample = ds[i]
-        # inference dataset의 2시점 = (x_{t-1}, x_t) condition
-        x_tm1 = sample["x_tm1"].unsqueeze(0)
+        # past condition = 관측 중심 프레임 x_t
         x_t = sample["x_t"].unsqueeze(0)
 
-        future, diag = generate_future_ensemble(
-            x_tm1, x_t, encoder, dit_past, dit_main, vae, normalizer,
+        ensemble, diag = generate_future_ensemble(
+            x_t, encoder, dit_past, dit_main, vae, normalizer,
             sampler, ensemble_size=args.ensemble_size, device=device,
             past_num_steps=past_num_steps, main_num_steps=main_num_steps,
         )
         torch.save(
             {
-                "future": future.cpu(),               # (B, 2, C, H, W)
+                "ensemble": ensemble.cpu(),           # (M, 1, C, H, W) 복원 x̂_t
+                "x_t": x_t.cpu(),                     # 관측 GT
                 "log_var_past": diag["log_var_past"],
                 "log_var_main": diag["log_var_main"],
                 "time_t": str(sample["time_t"]),
