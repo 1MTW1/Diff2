@@ -1,7 +1,7 @@
 """실험 8 (v2 LDM/DiT): 서울 중심 3×3 영역 pixelwise time-lag correlation.
 
 exp7 의 spatial Pearson (한 시점 안 픽셀들의 cross-corr) 과 대비:
-각 픽셀 p 에 대해 lag 별 valid 시점 시계열 u(·, p) 와 T(·+lag·6h, p) 두 시계열을
+각 픽셀 p 에 대해 lag 별 valid 시점 시계열 u(·, p) 와 T(·+lag·24h, p) 두 시계열을
 모아 시간 차원 Pearson r 을 계산한다 → 픽셀당 한 값 → 3×3 spatial map.
 
 데이터 좌표 확인 (dataset/era5_dataset.py):
@@ -38,7 +38,7 @@ LON_SLICE = slice(31, 34)   # 126, 127, 128 °E
 BOX_H, BOX_W = 3, 3
 
 LAGS = [-3, -2, -1, 0, 1, 2, 3]
-STEP_HOURS = 6
+STEP_HOURS = 24            # v4: 매일 00 UTC 스냅샷 → lag 단위 = 1일 (±3일까지)
 LAG_HOURS = [k * STEP_HOURS for k in LAGS]
 
 _EPS = 1e-12

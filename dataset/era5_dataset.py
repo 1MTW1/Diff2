@@ -32,6 +32,22 @@ def collate_with_time(batch):
     return collate(batch, collate_fn_map=_COLLATE_FN_MAP)
 
 
+def resolve_data_source(config: dict) -> tuple[str, str]:
+    """config 로부터 (zarr 경로, 변수명) 결정 — 학습/추론/통계 공용.
+
+    `data.use_00utc_only: true` 면 00시 스냅샷의 표준화 anomaly zarr 를 공급한다
+    (IMPLEMENTATION_SPEC v4 §3: VAE 가 보는 데이터 = 표준화 anomaly x̃).
+    아니면 기존 시각별 정규화 zarr.
+    """
+    d = config["data"]
+    if d.get("use_00utc_only", False):
+        return (
+            d.get("anomaly_path", "data/era5_00utc_anomaly.zarr"),
+            d.get("anomaly_var", "anomaly"),
+        )
+    return d["normalized_path"], d.get("normalized_var", "normalized")
+
+
 class ERA5NormalizedDataset(Dataset):
     """사전 정규화된 ERA5 데이터를 연속 3시점 윈도우로 반환.
 
@@ -57,6 +73,7 @@ class ERA5NormalizedDataset(Dataset):
         mode: str = "train",           # 'train' or 'inference' (윈도우 동일)
         split: str = "train",          # 'train' / 'validation' / 'test'
         load_into_memory: bool = False,
+        var_name: str = "normalized",  # zarr 변수명 (anomaly 일 땐 'anomaly')
     ):
         super().__init__()
         if mode not in ("train", "inference"):
@@ -65,6 +82,7 @@ class ERA5NormalizedDataset(Dataset):
             raise ValueError(f"Unknown split: {split}")
         self.mode = mode
         self.split = split
+        self.var_name = var_name
 
         ds = xr.open_zarr(normalized_path)
         start, end = self.SPLIT_RANGES[split]
@@ -78,11 +96,11 @@ class ERA5NormalizedDataset(Dataset):
             )
 
         if load_into_memory:
-            self.data = ds_split["normalized"].values.astype(np.float32)
+            self.data = ds_split[var_name].values.astype(np.float32)
             self.zarr_handle = None
         else:
             self.data = None
-            self.zarr_handle = ds_split["normalized"]
+            self.zarr_handle = ds_split[var_name]
 
         # x_{t-1}, x_{t+1} 모두 유효 → abs_idx ∈ [1, n_times-2]
         self.valid_start = 1
@@ -110,7 +128,12 @@ class ERA5NormalizedDataset(Dataset):
             "x_tm1":  torch.from_numpy(chunk[0]),
             "x_t":    torch.from_numpy(chunk[1]),
             "x_tp1":  torch.from_numpy(chunk[2]),
-            "time_t": self.times[abs_idx],
+            # 각 프레임의 실제 시각 — 추론 시 climatology 역표준화의 doy 조회용.
+            # (00시 스냅샷 데이터는 결측일로 인해 이웃이 정확히 ±1일이 아닐 수 있으므로
+            #  인덱스가 아니라 실제 time 으로 doy 를 구해야 정확하다.)
+            "time_tm1": self.times[abs_idx - 1],
+            "time_t":   self.times[abs_idx],
+            "time_tp1": self.times[abs_idx + 1],
         }
 
 
@@ -130,11 +153,13 @@ class ERA5FrameDataset(Dataset):
         normalized_path: str = "data/era5_normalized.zarr",
         split: str = "train",
         load_into_memory: bool = False,
+        var_name: str = "normalized",  # zarr 변수명 (anomaly 일 땐 'anomaly')
     ):
         super().__init__()
         if split not in self.SPLIT_RANGES:
             raise ValueError(f"Unknown split: {split}")
         self.split = split
+        self.var_name = var_name
 
         ds = xr.open_zarr(normalized_path)
         start, end = self.SPLIT_RANGES[split]
@@ -147,11 +172,11 @@ class ERA5FrameDataset(Dataset):
             )
 
         if load_into_memory:
-            self.data = ds_split["normalized"].values.astype(np.float32)
+            self.data = ds_split[var_name].values.astype(np.float32)
             self.zarr_handle = None
         else:
             self.data = None
-            self.zarr_handle = ds_split["normalized"]
+            self.zarr_handle = ds_split[var_name]
 
     def __len__(self) -> int:
         return self.n_times

@@ -1,9 +1,12 @@
-"""experiments_dit용 공용 유틸: latent 캐시 I/O, denormalize, plot helper.
+"""experiments_dit용 공용 유틸: latent/픽셀 캐시 I/O, plot helper.
 
-experiments/utils.py 의 v2 LDM/DiT 판. 캐시는 프레임별 latent 공간 (C_z=6, 16×16)으로
-저장되며 (x̂_t latent), 디코딩된 픽셀 필드(`ensemble_pixel`=x̂_t, `x_t_true_pixel`=GT x_t)도
-함께 들어 있을 수 있다. `EnsembleSample`은 추가 픽셀 키를 optional 필드로
-보유하고, npz에 없으면 `None`으로 둔다.
+experiments/utils.py 의 v4 LDM/DiT 판. 캐시는 프레임별 latent 공간 (C_z=6, 16×16)으로
+저장되며 (x̂_t latent), 디코딩·물리단위 복원된 픽셀 필드(`ensemble_pixel`=x̂_t,
+`x_t_true_pixel`=GT x_t)도 함께 들어 있다. `EnsembleSample`은 추가 픽셀 키를 optional
+필드로 보유하고, npz에 없으면 `None`으로 둔다.
+
+★v4: 캐시 픽셀은 ensemble_inference 가 climatology 로 이미 물리단위 복원해 저장하므로,
+별도 역정규화(normalization_stats)는 불필요 — 관련 denorm helper 는 제거됨.
 """
 from __future__ import annotations
 
@@ -12,10 +15,6 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 import numpy as np
-import pandas as pd
-import torch
-
-from dataset.denormalize import HOUR_TO_IDX, load_stats
 
 
 VARIABLES = ("t", "u", "v")
@@ -110,38 +109,6 @@ def list_ensemble_files(ensemble_dir: Path | str) -> list[Path]:
 def iter_ensemble_samples(ensemble_dir: Path | str) -> Iterator[EnsembleSample]:
     for f in list_ensemble_files(ensemble_dir):
         yield load_ensemble_npz(f)
-
-
-def denorm_array(
-    x_norm: np.ndarray,
-    time_t: np.datetime64,
-    mean: torch.Tensor,
-    std: torch.Tensor,
-) -> np.ndarray:
-    """역정규화: (C,H,W) or (N,C,H,W) numpy. mean/std는 (4,C,H,W) torch."""
-    hour = pd.Timestamp(time_t).hour
-    h_idx = HOUR_TO_IDX[int(hour)]
-    mu = mean[h_idx].cpu().numpy()      # (C, H, W)
-    sigma = std[h_idx].cpu().numpy()
-    return x_norm * sigma + mu
-
-
-def denorm_spread(
-    spread_norm: np.ndarray,
-    time_t: np.datetime64,
-    std: torch.Tensor,
-) -> np.ndarray:
-    """Spread/std는 mean 빼고 σ만 곱함 (additive shift 무효)."""
-    hour = pd.Timestamp(time_t).hour
-    h_idx = HOUR_TO_IDX[int(hour)]
-    sigma = std[h_idx].cpu().numpy()
-    return spread_norm * sigma
-
-
-def load_norm_stats(
-    stats_path: str = "data/normalization_stats.zarr",
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return load_stats(stats_path, device="cpu")
 
 
 def ensure_dir(p: Path | str) -> Path:

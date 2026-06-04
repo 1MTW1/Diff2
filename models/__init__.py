@@ -6,9 +6,14 @@ LDM 변환 후 핵심 컴포넌트:
   - VDMSchedule       : 연속시간 VP noise schedule
   - ConditionEncoder  : 프레임별 2D conv condition 인코더 (past 1프레임 / main 2프레임)
   - DualHeadDiT       : Transformer diffusion backbone (U-Net 대체)
+  - ClimatologyBank   : day-of-year climatology anchor (표준화 anomaly 전환)
 """
+from .climatology import ClimatologyBank, build_climatology, doy_slot
 from .dit import DualHeadDiT, build_dit
-from .encoder import ConditionEncoder, build_encoder
+from .encoder import (
+    ConditionEncoder, SnapshotType, NUM_SNAPSHOT_TYPES, build_encoder,
+    past_snapshots, main_snapshots,
+)
 from .latent_norm import LatentNormalizer
 from .pos_emb import sinusoidal_2d_pos_emb
 from .schedule import VDMSchedule
@@ -27,4 +32,11 @@ __all__ = [
     "build_dit",
     "SinusoidalTimeEmbedding",
     "sinusoidal_2d_pos_emb",
+    "ClimatologyBank",
+    "build_climatology",
+    "doy_slot",
+    "SnapshotType",
+    "NUM_SNAPSHOT_TYPES",
+    "past_snapshots",
+    "main_snapshots",
 ]

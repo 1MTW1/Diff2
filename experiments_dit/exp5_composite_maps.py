@@ -8,7 +8,7 @@ composite map 을 그린다 (lead × sample 당 1 그림):
 공유 colorbar 2개:
     - 절대(panel 0·15) : {GT_T, mean_T} 의 (min, max)
     - 차이(panel 1..14): 모든 (GT_T − member_T) 의 (min, max)   ← literal min/max
-픽셀 필드는 물리 단위로 역정규화된다. 이웃(t±1)은 t±6h 의 시각별 통계를 쓴다.
+픽셀 필드는 물리 단위(climatology 역표준화 완료). 이웃(t±1)은 ±1일(±24h) 시점.
 입력 캐시는 이웃 저장 버전 ensemble_inference 로 생성해야 한다.
 """
 from __future__ import annotations
@@ -18,12 +18,13 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import yaml
 
-from dataset.denormalize import HOUR_TO_IDX
+from models.climatology import doy_slot
 
 from .utils import (
     TEMP_IDX, U_IDX, V_IDX, ensure_dir, list_ensemble_files,
-    load_ensemble_npz, load_norm_stats, set_plot_defaults,
+    load_ensemble_npz, set_plot_defaults,
 )
 
 
@@ -34,32 +35,12 @@ _QUIVER_KEY_MAGNITUDE = 20.0  # m/s, 화살표 길이 reference
 
 _N_MEMBERS_SHOWN = 14        # panel 1..14
 # (라벨, 파일명 토큰, 멤버 픽셀 키, GT 픽셀 키, 중심으로부터 시간 오프셋[h])
+# 이웃은 ±1일(±24h) — v4 데이터는 매일 00 UTC 스냅샷.
 _LEADS = [
-    ("t-1", "tm1", "ensemble_pixel_tm1", "x_tm1_true_pixel", -6),
-    ("t",   "t",   "ensemble_pixel",     "x_t_true_pixel",    0),
-    ("t+1", "tp1", "ensemble_pixel_tp1", "x_tp1_true_pixel",  6),
+    ("t-1", "tm1", "ensemble_pixel_tm1", "x_tm1_true_pixel", -24),
+    ("t",   "t",   "ensemble_pixel",     "x_t_true_pixel",     0),
+    ("t+1", "tp1", "ensemble_pixel_tp1", "x_tp1_true_pixel",  24),
 ]
-
-
-def _denorm_field(
-    x_norm: np.ndarray, time_t, mean, std,
-) -> np.ndarray:
-    """(C, H, W) 또는 (N, C, H, W) → 역정규화."""
-    hour = pd.Timestamp(time_t).hour
-    h_idx = HOUR_TO_IDX[int(hour)]
-    mu = mean[h_idx].cpu().numpy()       # (C, H, W)
-    sig = std[h_idx].cpu().numpy()
-    return x_norm * sig + mu
-
-
-def _denorm_spread_field(
-    s_norm: np.ndarray, time_t, std,
-) -> np.ndarray:
-    """spread는 mean shift 없음."""
-    hour = pd.Timestamp(time_t).hour
-    h_idx = HOUR_TO_IDX[int(hour)]
-    sig = std[h_idx].cpu().numpy()
-    return s_norm * sig
 
 
 def _clip_wind(u: np.ndarray, v: np.ndarray, max_mag: float):
@@ -175,26 +156,29 @@ def _save_composite(
 
 
 def _save_spread(
-    spread_norm: np.ndarray, spread_denorm: np.ndarray,
-    time_t, out_path: Path,
+    spread_phys: np.ndarray, spread_norm: np.ndarray, time_t, out_path: Path,
 ) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
-    for ax, data, title, unit in zip(
-        axes,
-        [spread_norm[TEMP_IDX], spread_denorm[TEMP_IDX]],
-        [f"Normalized spread (t)",
-         f"Denormalized spread (t)"],
-        ["", "K"],
-    ):
-        im = ax.imshow(data, cmap="viridis")
-        ax.set_title(title)
-        ax.set_xticks([]); ax.set_yticks([])
-        cb = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.04)
-        if unit:
-            cb.set_label(unit)
+    """앙상블 멤버 spread 비교 — 물리공간 vs 정규화공간 (2행 × T/u/v 3열).
+
+    상단: 물리단위 spread (K, m/s) = std(members).
+    하단: 정규화 spread (무차원) = climatology σ(doy) 로 표준화한 멤버의 std
+          = 물리 spread / c_sig[doy]  (std((x−c_mu)/c_sig) = std(x)/c_sig).
+    """
+    var_cols = [(TEMP_IDX, "T", "K"), (U_IDX, "u", "m/s"), (V_IDX, "v", "m/s")]
+    rows = [(spread_phys, "physical"), (spread_norm, "normalized")]
+    fig, axes = plt.subplots(2, 3, figsize=(13, 8))
+    for i, (field, space) in enumerate(rows):
+        for j, (ci, name, unit) in enumerate(var_cols):
+            ax = axes[i, j]
+            im = ax.imshow(field[ci], cmap="viridis")
+            ax.set_title(f"{space} spread {name}")
+            ax.set_xticks([]); ax.set_yticks([])
+            cb = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.04)
+            cb.set_label(unit if space == "physical" else "σ (climatology)")
     fig.suptitle(
-        f"Exp5 spread — {pd.Timestamp(time_t).strftime('%Y-%m-%d %H:%M')}",
-        y=1.02,
+        f"Exp5 spread (physical vs normalized) — "
+        f"{pd.Timestamp(time_t).strftime('%Y-%m-%d %H:%M')}",
+        y=1.0,
     )
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
@@ -206,10 +190,15 @@ def run_exp5(
     figures_dir: str,
     n_samples: int = 3,
     seed: int = 42,
+    config_path: str = "config/default.yaml",
 ) -> dict:
     set_plot_defaults()
     fig_dir = ensure_dir(figures_dir)
-    mean, std = load_norm_stats()
+
+    # climatology c_sig(doy) — 정규화공간 spread 계산용 (물리 spread / c_sig[doy]).
+    with open(config_path) as f:
+        cfg = yaml.safe_load(f)
+    c_sig = np.load(cfg["climatology"]["path"])["c_sig"]   # (366, C, H, W)
 
     files = list_ensemble_files(Path(ensemble_dir))
     rng = np.random.default_rng(seed)
@@ -220,22 +209,19 @@ def run_exp5(
     for k, idx in enumerate(picks, start=1):
         es = load_ensemble_npz(files[idx])
         for lead, tok, mem_key, gt_key, off_h in _LEADS:
-            mem_norm = getattr(es, mem_key)
-            gt_norm = getattr(es, gt_key)
-            if mem_norm is None or gt_norm is None:
+            members = getattr(es, mem_key)               # (N,C,H,W) 물리단위
+            gt = getattr(es, gt_key)                      # (C,H,W) 물리단위
+            if members is None or gt is None:
                 raise KeyError(
                     f"{files[idx]} 에 '{mem_key}'/'{gt_key}' 가 없습니다 — 이웃 저장 "
                     f"버전 experiments_dit.ensemble_inference 로 캐시를 재생성하세요."
                 )
             lead_time = es.time_t + np.timedelta64(off_h, "h")
-            gt_d = _denorm_field(gt_norm, lead_time, mean, std)        # (C,H,W)
-            members_d = _denorm_field(mem_norm, lead_time, mean, std)  # (N,C,H,W)
-            mean_d = members_d.mean(axis=0)                            # (C,H,W)
 
             sample = {
-                "gt": gt_d,
-                "members": members_d,
-                "mean": mean_d,
+                "gt": gt,
+                "members": members,
+                "mean": members.mean(axis=0),             # (C,H,W)
                 "time_t": lead_time,
                 "lead": lead,
             }
@@ -243,10 +229,12 @@ def run_exp5(
                 sample, fig_dir / f"exp5_composite_sample{k}_{tok}.png",
             )
 
-            spread_norm = mem_norm.std(axis=0, ddof=1)                 # (C,H,W)
-            spread_d = _denorm_spread_field(spread_norm, lead_time, std)
+            spread_phys = members.std(axis=0, ddof=1)     # (C,H,W) 물리단위 멤버 spread
+            # 정규화공간 spread: climatology σ(doy)로 표준화 = 물리 spread / c_sig[doy].
+            doy = int(doy_slot(lead_time)[0])
+            spread_norm = spread_phys / c_sig[doy]         # (C,H,W) 무차원
             _save_spread(
-                spread_norm, spread_d, lead_time,
+                spread_phys, spread_norm, lead_time,
                 fig_dir / f"exp5_spread_sample{k}_{tok}.png",
             )
         chosen.append({
@@ -267,5 +255,8 @@ if __name__ == "__main__":
     p.add_argument("--figures_dir", default="outputs/figures_dit")
     p.add_argument("--n_samples", type=int, default=3)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--config", default="config/default.yaml",
+                   help="climatology.path(c_sig) 로드용 config")
     args = p.parse_args()
-    run_exp5(args.ensemble_dir, args.figures_dir, args.n_samples, args.seed)
+    run_exp5(args.ensemble_dir, args.figures_dir, args.n_samples,
+             args.seed, args.config)

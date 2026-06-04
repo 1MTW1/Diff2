@@ -26,10 +26,9 @@ import numpy as np
 
 from .utils import (
     SEOUL_LAT_IDX, SEOUL_LAT_SLICE, SEOUL_LON_IDX, SEOUL_LON_SLICE, VARIABLES,
-    ensure_dir, list_ensemble_files, load_ensemble_npz, load_norm_stats,
+    ensure_dir, list_ensemble_files, load_ensemble_npz,
     set_plot_defaults,
 )
-from .exp5_composite_maps import _denorm_field
 
 _EPS = 1e-12
 
@@ -52,7 +51,6 @@ def _collect_series(
     Returns dict with arrays shaped (T, C, 3, 3): gt_tm1, gt_tp1, en_tm1, en_tp1.
     """
     files = list_ensemble_files(ensemble_dir)
-    mean, std = load_norm_stats()
     box = (slice(None), SEOUL_LAT_SLICE, SEOUL_LON_SLICE)   # (C, 3, 3)
 
     gt_tm1, gt_tp1, en_tm1, en_tp1 = [], [], [], []
@@ -65,22 +63,19 @@ def _collect_series(
                 f"{f} 에 이웃 픽셀 필드가 없습니다 — 이웃 저장 버전 "
                 f"experiments_dit.ensemble_inference 로 캐시를 재생성하세요."
             )
-        tm1_time = es.time_t - np.timedelta64(6, "h")
-        tp1_time = es.time_t + np.timedelta64(6, "h")
+        # 캐시는 이미 물리단위 (climatology 역표준화 완료) → Seoul box 슬라이스만.
+        gt_tm1.append(es.x_tm1_true_pixel[box])
+        gt_tp1.append(es.x_tp1_true_pixel[box])
 
-        # ERA5 (denorm) — (C,H,W) → Seoul box
-        gt_tm1.append(_denorm_field(es.x_tm1_true_pixel, tm1_time, mean, std)[box])
-        gt_tp1.append(_denorm_field(es.x_tp1_true_pixel, tp1_time, mean, std)[box])
-
-        # ensemble: member 선택 또는 멤버 평균 → (C,H,W) → denorm → box
+        # ensemble: member 선택 또는 멤버 평균 → (C,H,W) → box
         if use_ens_mean:
             em1 = es.ensemble_pixel_tm1.mean(axis=0)
             ep1 = es.ensemble_pixel_tp1.mean(axis=0)
         else:
             em1 = es.ensemble_pixel_tm1[member]
             ep1 = es.ensemble_pixel_tp1[member]
-        en_tm1.append(_denorm_field(em1, tm1_time, mean, std)[box])
-        en_tp1.append(_denorm_field(ep1, tp1_time, mean, std)[box])
+        en_tm1.append(em1[box])
+        en_tp1.append(ep1[box])
 
     return {
         "gt_tm1": np.stack(gt_tm1), "gt_tp1": np.stack(gt_tp1),

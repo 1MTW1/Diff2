@@ -1,22 +1,55 @@
 # Diffusion²-LDM — Latent Diffusion 기반 Flow-Dependent Ensemble Generation.
-# instruction_v2.md (픽셀 공간 Dual-DDPM → LDM 변환)에 따른 설정.
+# IMPLEMENTATION_SPEC v4 (00 UTC 스냅샷 climatology-anomaly 전환) 설정.
 
 # ── Data ──────────────────────────────────────────────────────────
+# 데이터 파이프라인 (전처리 → 모델 로딩):
+#   [원본]  era5_normalized.zarr (6h, 시각별 pixelwise 정규화)
+#           + normalization_stats.zarr (mean/std: (hour,C,H,W))
+#     │  python -m scripts.compute_daily_snapshot   (00시 추출 + 00시 통계로 역정규화)
+#     ▼
+#   era5_00utc.zarr  (00시 스냅샷, **물리단위**)
+#     ├─ python -m scripts.compute_climatology  → climatology.npz  (c_mu, c_sig)
+#     ├─ python -m scripts.compute_pixel_stats  → pixel_stats.npz  (P_mu, P_sig)
+#     └─ python -m scripts.compute_anomaly      → era5_00utc_anomaly.zarr (x̃)
+#                                                  ▲ ★ VAE·diffusion 의 학습/추론 입력
 data:
-  normalized_path: 'data/era5_normalized.zarr'
-  stats_path: 'data/normalization_stats.zarr'   # 픽셀 역정규화용 (latent와 무관)
   variables: ['t', 'u', 'v']     # temperature, u-wind, v-wind
   n_channels: 3                  # C
   spatial: [64, 64]              # H x W (한반도 patch)
-  target_frames: 2               # 비대칭: DDPM_past=2(x_{t-1},x_{t+1}), DDPM_main=1(x_t). 코드 직접 미사용
   time_step_hours: 6
+  target_frames: 2               # 비대칭: past=2(x_{t-1},x_{t+1}), main=1(x_t). 코드 직접 미사용
 
+  # ── (1) 전처리 SOURCE — compute_daily_snapshot.py 입력. 모델은 직접 안 읽음 ──
+  normalized_path: 'data/era5_normalized.zarr'   # 6h 시각별 정규화 원본 (use_00utc_only=false 시 fallback)
+  stats_path: 'data/normalization_stats.zarr'    # 00시 역정규화용 (hour,C,H,W). 문서용 — 스크립트는 --stats 로 받음
+
+  # ── (2) 전처리 중간 산출물 — climatology/pixel_stats/anomaly 스크립트 입력 ──
+  snapshot_path: 'data/era5_00utc.zarr'          # 00시 스냅샷 (물리단위)
+  snapshot_var: 'snapshot'
+
+  # ── (3) ★ 모델 학습/추론이 실제 로딩 (dataset.resolve_data_source) ──
+  use_00utc_only: true                           # true → 아래 anomaly_path/anomaly_var 로딩
+  anomaly_path: 'data/era5_00utc_anomaly.zarr'   # 표준화 anomaly x̃ — VAE·diffusion 입력/타깃
+  anomaly_var: 'anomaly'
+
+  # split 기간 (참조용 — 실제 값은 dataset/era5_dataset.py 의 SPLIT_RANGES 에 하드코딩)
   splits:
     train:      ['2000-01-01', '2019-12-31']
     validation: ['2020-01-01', '2021-12-31']
     test:       ['2022-01-01', '2022-12-31']
 
-# ── VAE — 프레임별 단일 VAE. Stage 0에서 별도 선학습 후 freeze (§2.1) ──
+# ── Climatology — day-of-year 2단계(raw → ±7d smoothing) anchor (§2, §3[2], §4) ──
+# ClimatologyBank(build_climatology)가 아래 두 npz 를 GPU buffer 로 상주 로드 (학습/추론 공통).
+climatology:
+  window_radius: 7               # ±7일 (총 15일) doy 축 smoothing window
+  path: 'data/climatology.npz'   # compute_climatology.py 산출물 (c_mu, c_sig; (366,C,H,W))
+  pixel_stats_path: 'data/pixel_stats.npz'  # compute_pixel_stats.py (P_mu, P_sig; (C,H,W), doy무관)
+  sigma_floor: 1.0e-6            # c_sig / P_sig 하한 (0 division 방어)
+
+# ── VAE — 프레임별 단일 VAE. Stage 0에서 별도 선학습 후 freeze (§6) ──
+# 학습 입력 = 표준화 anomaly x̃ (data.anomaly_path). 구조 변경 없음, 입출력만 anomaly.
+# 실행:  accelerate launch ... -m training.train_vae --output_dir outputs/vae_v3
+#        (--output_dir 은 아래 checkpoint/stats_path 의 디렉터리와 반드시 일치시킬 것)
 vae:
   in_channels: 3           # 단일 프레임 = n_channels (C)
   latent_channels: 6       # per-frame C_z = 2 × in_channels (총 8배 압축)
@@ -26,7 +59,8 @@ vae:
   kl_weight: 1.0e-6        # 약한 KL — LDM/SD 관례. 키우면 posterior collapse 위험
   grad_weight: 0.0         # spatial gradient 재구성 보조항 (0 = off)
   logvar_clip: [-30.0, 20.0]
-  checkpoint: 'outputs/vae_v2/vae_best.pt'   # diffusion 학습이 frozen으로 로드 (프레임별 3ch VAE)
+  # Stage 0 산출물 → diffusion 학습/추론이 frozen 으로 로드. output_dir 와 일치 필요.
+  checkpoint: 'outputs/vae_v3/vae_best.pt'
   training:                # Stage 0 학습 하이퍼파라미터
     epochs: 500            # 충분한 수렴을 위해 길게
     lr: 1.0e-4
@@ -37,18 +71,23 @@ vae:
     checkpoint_every: 10
     validation_every: 5
 
-# ── Latent 정규화 — VAE 학습 후 사후 통계 (§2.2) ───────────────────
+# ── Latent 정규화 — VAE 학습 후 사후 통계 (§2.3) ───────────────────
+# scripts/compute_latent_stats.py 산출물 (z=μ 결정론적 통계). checkpoint 와 같은 디렉터리 권장.
 latent_norm:
   mode: channel_pixelwise        # {channel_pixelwise, channelwise}
-  stats_path: 'outputs/vae_v2/latent_stats.pt'
+  stats_path: 'outputs/vae_v3/latent_stats.pt'
 
-# ── Condition Encoder — 프레임별 2D conv (§2.3) ───────────────────
-# past cond=x_t(1프레임)→256토큰, main cond=[x̂_{t-1},x̂_{t+1}](2프레임)→512토큰(+time emb).
+# ── Condition Encoder — snapshot 기반 (type emb + self-attn) (§5) ──
+# snapshot 당 256토큰. past/main 모두 3 snapshot → 768 토큰.
+#   past: {x̃_t, c̃_{t-1}, c̃_{t+1}}   main: {x̃_{t-1}, x̃_{t+1}, c̃_t}
 encoder:
   hidden_channels: 64      # C' (2D conv 출력 채널)
   num_layers: 2
-  patch_size: 4            # 64 → 16 토큰 격자 (프레임당 256 토큰)
+  patch_size: 4            # 64 → 16 토큰 격자 (snapshot당 256 토큰)
   token_dim: 384           # D — dit.token_dim과 반드시 일치
+  num_snapshot_types: 6    # SnapshotType enum 크기 (anomaly/climatology × prev/center/next)
+  snapshot_attn_layers: 2  # snapshot 간 self-attention 블록 수
+  snapshot_attn_heads: 6   # snapshot self-attention head 수 (token_dim 나누어떨어져야 함)
 
 # ── DiT backbone + dual-head (§2.4) ───────────────────────────────
 # latent_channels는 config에 두지 않고 빌더가 vae.latent_channels에서 유도:
@@ -71,12 +110,19 @@ schedule:
 dual_head:
   log_var_clip: [-10.0, 10.0]
 
-# ── Sampling (§4) ─────────────────────────────────────────────────
+# ── Sampling (§9) ─────────────────────────────────────────────────
 sampling:
-  past_num_steps: 50             # DDPM_past 추론 denoising step (past_sampling_steps_train과 일치 — §3.3 OOD 방지)
+  past_num_steps: 50             # DDPM_past 추론 denoising step (past_sampling_steps_train과 일치 — OOD 방지)
   main_num_steps: 200            # DDPM_main 추론 denoising step (main은 학습 시 롤아웃 없음 — step 수 자유)
   past_sampling_steps_train: 50  # 학습 시 past 샘플링 step (past_num_steps와 일치 — OOD 방지)
   past_sample_cache: false       # past 생성물 캐싱 (학습 비용 완화 옵션)
+  # ── logvar 잔여노이즈 주입 (IMPLEMENTATION_SPEC §9.1) ──
+  # DDPM_past 는 매 step('all') logvar·scale 주입으로 이웃 anomaly 다양성(spread) 공급.
+  # 주의: 유효 spread 가 step 수에 비례 누적(≈sqrt(steps)·scale). 0.1 은 시작값 — 측정 후 튜닝.
+  # DDPM_main 은 주입 없음('none'): main 의 log_var 는 학습 NLL 가중 전용.
+  past_inject_mode: all
+  past_inject_scale: 0.1
+  main_inject_mode: none
 
 # ── Training — Stage 1~3 diffusion 학습 ───────────────────────────
 # batch_size는 *per-process* (DDP 각 GPU당) 크기.
@@ -84,7 +130,7 @@ training:
   batch_size: 32      # per-process (DDP 각 GPU당). 4-GPU → 글로벌 512
   lr: 1.0e-4
   weight_decay: 1.0e-5
-  total_epochs: 200ß
+  total_epochs: 200
   num_workers: 4
   grad_clip: 1.0
   loss: heteroscedastic_nll

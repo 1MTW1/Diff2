@@ -1,8 +1,8 @@
 """실험 7 (v2 LDM/DiT): 한반도 영역 u ↔ T time-lag spatial correlation.
 
 각 valid 시점 t 에 대해 한반도 영역 (lat 33–43°N, lon 124–132°E, 11×9=99 px) 의
-픽셀들 사이에서 u(t,p) 와 T(t+lag·6h, p) 의 spatial Pearson r 을 lag ∈ [-3,3]
-step (= ±18h) 으로 계산하고, GT 시계열과 ensemble 시계열을 위/아래 sub-panel
+픽셀들 사이에서 u(t,p) 와 T(t+lag·24h, p) 의 spatial Pearson r 을 lag ∈ [-3,3]
+step (= ±3일) 으로 계산하고, GT 시계열과 ensemble 시계열을 위/아래 sub-panel
 로 비교한다. 출력은 3개 PNG: member A, member B, ensemble mean.
 
 데이터는 ensemble cache (sample_*.npz) 의 `x_t_true_pixel` (GT) 과
@@ -34,7 +34,7 @@ LAT_SLICE = slice(26, 37)   # lat 43 → 33 °N
 LON_SLICE = slice(29, 38)   # lon 124 → 132 °E
 
 LAGS = [-3, -2, -1, 0, 1, 2, 3]
-STEP_HOURS = 6
+STEP_HOURS = 24            # v4: 매일 00 UTC 스냅샷 → lag 단위 = 1일 (±3일까지)
 LAG_HOURS = [k * STEP_HOURS for k in LAGS]
 
 _EPS = 1e-12
@@ -62,10 +62,10 @@ def _build_time_map(files: list[Path]) -> dict[np.datetime64, Path]:
 def _valid_times_per_lag(
     time_map: dict[np.datetime64, Path],
 ) -> dict[int, list[np.datetime64]]:
-    """lag 별로 t+lag·6h 가 cache 안에 존재하는 시점 리스트.
+    """lag 별로 t+lag·24h 가 cache 안에 존재하는 시점 리스트.
 
-    캐시가 Mon/Wed/Fri 일자별로 dense (4 timestep) 라 inter-day lag 는 결측 →
-    lag 마다 valid t 셋이 다르다. 각 lag 별로 독립 시계열을 plot.
+    v4 캐시는 매일 00 UTC 스냅샷(1일 간격)이므로 lag 단위는 1일이다. 결측일이 있으면
+    해당 t 에서 t+lag·24h 가 없어 lag 마다 valid t 셋이 달라진다. 각 lag 별 독립 시계열.
     """
     sorted_t = sorted(time_map.keys())
     per_lag: dict[int, list[np.datetime64]] = {}

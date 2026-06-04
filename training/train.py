@@ -54,10 +54,13 @@ from datetime import timedelta
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from dataset.era5_dataset import ERA5NormalizedDataset, collate_with_time
+from dataset.era5_dataset import (
+    ERA5NormalizedDataset, collate_with_time, resolve_data_source,
+)
 from inference.sampling import LatentVDMSampler
+from models.climatology import build_climatology, doy_slot
 from models.dit import build_dit
-from models.encoder import build_encoder
+from models.encoder import build_encoder, main_snapshots, past_snapshots
 from models.latent_norm import LatentNormalizer
 from models.schedule import VDMSchedule
 from models.vae import build_vae
@@ -90,6 +93,35 @@ def _build_schedule(config: dict) -> VDMSchedule:
     )
 
 
+def _load_climatology(config: dict, device: torch.device):
+    """use_00utc_only 이면 ClimatologyBank(frozen) 로드 — climatology condition 용 (§1).
+
+    아니면 None (legacy anomaly-only 경로). 학습 파라미터 없음.
+    """
+    if not config["data"].get("use_00utc_only", False):
+        return None
+    return build_climatology(config).to(device)
+
+
+def _clim_cond(clim, doy):
+    """climatology pixel-norm condition (없으면 None)."""
+    return None if clim is None else clim.climatology_pixel_norm(doy)
+
+
+def _resolve_past_inject(
+    config: dict, args: argparse.Namespace,
+) -> tuple[str, float]:
+    """DDPM_past 샘플링 주입 (mode, scale) 결정 — train↔inference OOD 정합.
+
+    CLI `--inject_mode` 가 명시되면 우선, 아니면 config sampling.past_inject_mode.
+    scale 은 config sampling.past_inject_scale (기본 0.1, SPEC §7.1).
+    """
+    sc = config["sampling"]
+    mode = args.inject_mode or sc.get("past_inject_mode", "all")
+    scale = float(sc.get("past_inject_scale", 0.1))
+    return mode, scale
+
+
 def _per_frame_channels(config: dict) -> int:
     """프레임별 VAE latent 채널 C_z (=6)."""
     return int(config["vae"]["latent_channels"])
@@ -104,10 +136,10 @@ def _past_latent_shape(config: dict) -> tuple[int, int, int]:
 
 def _train_window_loader(config: dict) -> DataLoader:
     """3시점(x_{t-1},x_t,x_{t+1}) train split DataLoader (past / joint 공용)."""
-    data_cfg = config["data"]
     tc = config["training"]
+    src_path, src_var = resolve_data_source(config)
     ds = ERA5NormalizedDataset(
-        normalized_path=data_cfg["normalized_path"],
+        normalized_path=src_path, var_name=src_var,
         mode="train", split="train", load_into_memory=True,
     )
     return DataLoader(
@@ -186,12 +218,17 @@ def _sample_past_condition(
     x_t: torch.Tensor,
     latent_shape: tuple[int, int, int],
     mode: str,
+    inject_scale: float = 0.1,
+    c_tm1: torch.Tensor | None = None,
+    c_tp1: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """past를 실제 샘플링·decode하여 main의 condition 재료 (x̂_{t-1}, x̂_{t+1})을 만든다.
 
     teacher forcing 금지 — past **생성물**을 cond로 써 cond-distribution OOD를
     방지한다. eval 모드로 샘플링하고 sampling 전체는 no_grad (역전파 안 함).
     반환 두 프레임은 상수 텐서이며, main은 이를 (grad 흐르는) encoder로 재인코딩한다.
+
+    past condition (§1): 중심 anomaly x̃_t + 이웃 climatology c̃_{t-1}, c̃_{t+1}.
     """
     B = x_t.shape[0]
     C_z, H_z, W_z = latent_shape                          # (12, 16, 16)
@@ -199,10 +236,10 @@ def _sample_past_condition(
 
     was_training = raw_dit_past.training
     raw_dit_past.eval()
-    cond_past = raw_encoder(x_t.unsqueeze(1))             # (B, 1, C, H, W) F=1
+    cond_past = raw_encoder(past_snapshots(x_t, c_tm1, c_tp1))
     z_past, _ = past_sampler.sample(
         raw_dit_past, cond_past, (B, C_z, H_z, W_z), device,
-        inject_uncertainty_mode=mode,
+        inject_uncertainty_mode=mode, inject_scale=inject_scale,
     )
     raw_dit_past.train(was_training)
 
@@ -233,6 +270,7 @@ def run_past(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
     encoder = build_encoder(config)
     dit_past = build_dit(config, latent_channels=2 * _per_frame_channels(config))
     vae, normalizer = _load_frozen_vae(config, device)
+    clim = _load_climatology(config, device)       # climatology condition (§1)
     schedule = _build_schedule(config)
 
     train_cfg = config["training"]
@@ -259,8 +297,16 @@ def run_past(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
         running, t0 = 0.0, time.time()
         for it, batch in enumerate(train_loader):
             x_tm1, x_t, x_tp1 = batch["x_tm1"], batch["x_t"], batch["x_tp1"]
-            # past: cond=x_t(1프레임), target=[ẑ_{t-1}‖ẑ_{t+1}](12ch)
-            cond = encoder(x_t.unsqueeze(1))                       # (B,1,C,H,W) F=1
+            # past (§1): cond = 중심 anomaly x̃_t + 이웃 climatology c̃_{t±1},
+            #            target = [ẑ_{t-1}‖ẑ_{t+1}] (12ch). 생성 대상=t±1 → 이웃 clim.
+            if clim is not None:
+                c_tm1 = clim.climatology_pixel_norm(
+                    clim.doy_from_times(batch["time_tm1"]))
+                c_tp1 = clim.climatology_pixel_norm(
+                    clim.doy_from_times(batch["time_tp1"]))
+            else:
+                c_tm1 = c_tp1 = None
+            cond = encoder(past_snapshots(x_t, c_tm1, c_tp1))
             z0 = _encode_pair_concat(vae, normalizer, x_tm1, x_tp1)
             loss = _diffusion_nll(dit_past, schedule, z0, cond)
 
@@ -322,7 +368,7 @@ def run_infer(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
     device = accelerator.device
     rank, world = accelerator.process_index, accelerator.num_processes
     M = args.ensemble_size
-    mode = args.inject_mode
+    mode, inject_scale = _resolve_past_inject(config, args)
     bs = max(1, args.batch_size)             # sampler 호출당 sample 수 (batch=bs×M)
 
     past_path = out_dir / "past.pt"
@@ -339,13 +385,15 @@ def run_infer(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
     encoder.eval(); dit_past.eval()
 
     # infer는 정규화 latent ẑ_0 를 그대로 저장한다 (decode는 main/joint에서). VAE 불필요.
+    clim = _load_climatology(config, device)       # climatology condition (§1)
     schedule = _build_schedule(config)
     steps = int(config["sampling"]["past_sampling_steps_train"])
     sampler = LatentVDMSampler(schedule, num_steps=steps)
     C_z, H_z, W_z = _past_latent_shape(config)         # (12, 16, 16)
 
+    src_path, src_var = resolve_data_source(config)
     ds = ERA5NormalizedDataset(
-        normalized_path=config["data"]["normalized_path"],
+        normalized_path=src_path, var_name=src_var,
         mode="train", split="train", load_into_memory=True,
     )
     N = len(ds)
@@ -368,7 +416,8 @@ def run_infer(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
     mm = np.lib.format.open_memmap(cond_path, mode="r+")
 
     accelerator.print(
-        f"[infer] world={world} N={N} M={M} steps={steps} mode={mode} "
+        f"[infer] world={world} N={N} M={M} steps={steps} "
+        f"inject={mode}×{inject_scale} "
         f"batch={bs}×M={bs * M} → {cond_path} ({mm.nbytes / 1e9:.1f} GB fp16 total)"
     )
     print(f"[infer] rank {rank}/{world} rows[{lo}:{hi}] ({hi - lo} samples)")
@@ -379,12 +428,20 @@ def run_infer(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
         S = min(bs, hi - start)
         items = [ds[start + s] for s in range(S)]
         x_t = torch.stack([it["x_t"] for it in items]).to(device)
-        cond = encoder(x_t.unsqueeze(1))                     # (S, 256, D), F=1
+        # past (§1): cond = 중심 anomaly x̃_t + 이웃 climatology c̃_{t±1}
+        if clim is not None:
+            t_tm1 = np.array([it["time_tm1"] for it in items])
+            t_tp1 = np.array([it["time_tp1"] for it in items])
+            c_tm1 = clim.climatology_pixel_norm(clim.doy_from_times(t_tm1))
+            c_tp1 = clim.climatology_pixel_norm(clim.doy_from_times(t_tp1))
+        else:
+            c_tm1 = c_tp1 = None
+        cond = encoder(past_snapshots(x_t, c_tm1, c_tp1))    # (S, N_cond, D)
         n_tok, d = cond.shape[1], cond.shape[2]
         cond = cond.unsqueeze(1).expand(S, M, n_tok, d).reshape(S * M, n_tok, d)
         z, _ = sampler.sample(
             dit_past, cond, (S * M, C_z, H_z, W_z), device,
-            inject_uncertainty_mode=mode,
+            inject_uncertainty_mode=mode, inject_scale=inject_scale,
         )
         z = z.reshape(S, M, C_z, H_z, W_z).to(torch.float16).cpu().numpy()
         mm[start:start + S] = z
@@ -395,7 +452,8 @@ def run_infer(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
     if accelerator.is_main_process:
         meta = {
             "n_samples": N, "ensemble_size": M, "latent_shape": [C_z, H_z, W_z],
-            "split": "train", "inject_mode": mode, "past_steps": steps,
+            "split": "train", "inject_mode": mode,
+            "inject_scale": inject_scale, "past_steps": steps,
             "times": [str(ds.times[i + ds.valid_start]) for i in range(N)],
         }
         with open(out_dir / "cond_meta.json", "w") as f:
@@ -429,18 +487,24 @@ class MainCondDataset(Dataset):
     def __getitem__(self, i: int) -> dict:
         s = self.base[i]
         z = np.asarray(self.cond[i, self.member], dtype=np.float32)
-        return {"x_t": s["x_t"], "z_past": torch.from_numpy(z)}
+        # 중심 climatology c_t 조회용 doy (int; default collate 호환).
+        doy_t = int(doy_slot(s["time_t"])[0])
+        return {"x_t": s["x_t"], "z_past": torch.from_numpy(z), "doy_t": doy_t}
 
 
 def _main_cond_to_target(
-    batch: dict, encoder, vae, normalizer,
+    batch: dict, encoder, vae, normalizer, clim=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """member latent(12ch) → (x̂_{t-1}, x̂_{t+1}) decode → cond_main, target z0_main(ẑ_t)."""
+    """member latent(12ch) → (x̂_{t-1}, x̂_{t+1}) decode → cond_main, target z0_main(ẑ_t).
+
+    main condition (§1): 이웃 anomaly x̃_{t±1} + 중심 climatology c̃_t (생성 대상=t).
+    """
     z_past = batch["z_past"]                # (B, 12, 16, 16) member 과거 latent
     x_t = batch["x_t"]
     with torch.no_grad():
         x_tm1_hat, x_tp1_hat = _decode_pair(vae, normalizer, z_past)
-    cond_main = encoder(torch.stack([x_tm1_hat, x_tp1_hat], dim=1))   # F=2
+    c_t = _clim_cond(clim, batch["doy_t"]) if clim is not None else None
+    cond_main = encoder(main_snapshots(x_tm1_hat, x_tp1_hat, c_t))
     z0_main = _encode_frame(vae, normalizer, x_t)                     # (B,6,16,16)
     return cond_main, z0_main
 
@@ -464,6 +528,7 @@ def run_main(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
     encoder.load_state_dict(ck_past["encoder"])
     dit_main = build_dit(config, latent_channels=_per_frame_channels(config))
     vae, normalizer = _load_frozen_vae(config, device)
+    clim = _load_climatology(config, device)       # climatology condition (§1)
     schedule = _build_schedule(config)
 
     train_cfg = config["training"]
@@ -472,8 +537,9 @@ def run_main(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
         lr=float(train_cfg["lr"]), weight_decay=float(train_cfg["weight_decay"]),
     )
 
+    src_path, src_var = resolve_data_source(config)
     base = ERA5NormalizedDataset(
-        normalized_path=config["data"]["normalized_path"],
+        normalized_path=src_path, var_name=src_var,
         mode="train", split="train", load_into_memory=True,
     )
     M = args.ensemble_size
@@ -509,7 +575,7 @@ def run_main(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
         running, t0 = 0.0, time.time()
         for it, batch in enumerate(train_loader):
             cond_main, z0_main = _main_cond_to_target(
-                batch, encoder, vae, normalizer
+                batch, encoder, vae, normalizer, clim
             )
             loss = _diffusion_nll(dit_main, schedule, z0_main, cond_main)
 
@@ -579,11 +645,13 @@ def run_joint(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
     dit_main.load_state_dict(ck_main["dit_main"])
 
     vae, normalizer = _load_frozen_vae(config, device)
+    clim = _load_climatology(config, device)       # climatology condition (§1)
     schedule = _build_schedule(config)
     past_sampler = LatentVDMSampler(
         schedule, num_steps=int(config["sampling"]["past_sampling_steps_train"]),
     )
     latent_shape = _past_latent_shape(config)              # (12, 16, 16)
+    inject_mode, inject_scale = _resolve_past_inject(config, args)
 
     train_cfg = config["training"]
     optimizer = torch.optim.AdamW(
@@ -594,7 +662,7 @@ def run_joint(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
     train_loader = _train_window_loader(config)
     accelerator.print(
         f"[joint] device={device} procs={accelerator.num_processes} "
-        f"epochs={args.joint_epochs} inject_mode={args.inject_mode}"
+        f"epochs={args.joint_epochs} inject={inject_mode}×{inject_scale}"
     )
     if accelerator.is_main_process:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -619,20 +687,30 @@ def run_joint(config: dict, out_dir: Path, args: argparse.Namespace) -> None:
         t0 = time.time()
         for it, batch in enumerate(train_loader):
             x_tm1, x_t, x_tp1 = batch["x_tm1"], batch["x_t"], batch["x_tp1"]
+            # climatology condition 조회 (생성 대상 시점 — §1).
+            if clim is not None:
+                c_tm1 = clim.climatology_pixel_norm(
+                    clim.doy_from_times(batch["time_tm1"]))
+                c_tp1 = clim.climatology_pixel_norm(
+                    clim.doy_from_times(batch["time_tp1"]))
+                c_t = clim.climatology_pixel_norm(
+                    clim.doy_from_times(batch["time_t"]))
+            else:
+                c_tm1 = c_tp1 = c_t = None
 
-            # ── L_past: cond=x_t, target=[ẑ_{t-1}‖ẑ_{t+1}] ──
-            cond_past = encoder(x_t.unsqueeze(1))                  # F=1
+            # ── L_past: cond=중심 anomaly+이웃 clim, target=[ẑ_{t-1}‖ẑ_{t+1}] ──
+            cond_past = encoder(past_snapshots(x_t, c_tm1, c_tp1))
             z0_past = _encode_pair_concat(vae, normalizer, x_tm1, x_tp1)
             L_past = _diffusion_nll(dit_past, schedule, z0_past, cond_past)
 
-            # ── L_main: past가 동적 생성한 cond=[x̂_{t-1},x̂_{t+1}], target=ẑ_t ──
+            # ── L_main: past가 동적 생성한 이웃 anomaly + 중심 clim, target=ẑ_t ──
             x_tm1_hat, x_tp1_hat = _sample_past_condition(
                 accelerator.unwrap_model(dit_past),
                 accelerator.unwrap_model(encoder),
                 vae, normalizer, past_sampler, x_t, latent_shape,
-                args.inject_mode,
+                inject_mode, inject_scale, c_tm1, c_tp1,
             )
-            cond_main = encoder(torch.stack([x_tm1_hat, x_tp1_hat], dim=1))  # F=2
+            cond_main = encoder(main_snapshots(x_tm1_hat, x_tp1_hat, c_t))
             z0_main = _encode_frame(vae, normalizer, x_t)          # (B,6,16,16)
             L_main = _diffusion_nll(dit_main, schedule, z0_main, cond_main)
 
@@ -754,9 +832,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--joint_epochs", type=int, default=50)
     p.add_argument("--ensemble_size", type=int, default=100,
                    help="phase=infer/main 의 과거 조건 member 수 M")
-    p.add_argument("--inject_mode", type=str, default="last",
+    p.add_argument("--inject_mode", type=str, default=None,
                    choices=["all", "last", "none"],
-                   help="past 샘플링 logvar 주입 schedule (infer/joint)")
+                   help="past 샘플링 logvar 주입 schedule (infer/joint). "
+                        "미지정 시 config sampling.past_inject_mode(기본 all) 사용.")
     p.add_argument("--batch_size", type=int, default=20,
                    help="phase=infer: sampler 호출당 처리할 sample 수 "
                         "(GPU batch = batch_size × ensemble_size)")

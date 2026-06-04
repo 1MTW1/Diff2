@@ -21,9 +21,10 @@ import torch
 import yaml
 from tqdm import tqdm
 
-from dataset.era5_dataset import ERA5NormalizedDataset
+from dataset.era5_dataset import ERA5NormalizedDataset, resolve_data_source
+from models.climatology import build_climatology
 from models.dit import build_dit
-from models.encoder import build_encoder
+from models.encoder import build_encoder, main_snapshots, past_snapshots
 from models.latent_norm import LatentNormalizer
 from models.schedule import VDMSchedule
 from models.vae import build_vae
@@ -89,6 +90,7 @@ class LatentVDMSampler:
         inject_uncertainty: bool = False,
         num_steps: int | None = None,
         inject_uncertainty_mode: str | None = None,
+        inject_scale: float = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """latent에서 N-step denoising.
 
@@ -101,6 +103,9 @@ class LatentVDMSampler:
                 "none" → 주입 없음 (= 기존 inject_uncertainty=False).
                 None (기본) 이면 boolean `inject_uncertainty` 로 매핑된다.
                 명시 시 boolean 보다 우선.
+            inject_scale: 주입 노이즈 scale (SPEC §7.1). DDPM_past 'all' 운용 시
+                0.1 권장 — z += scale·exp(0.5·log_var)·η.
+                **주의**: step 수에 비례해 유효 spread 가 누적된다(≈sqrt(steps)·scale).
 
         Returns:
             z0:        (B, C_z, H_z, W_z) 최종 정규화 latent ẑ_0
@@ -136,11 +141,11 @@ class LatentVDMSampler:
             else:
                 z = self._reverse_step(z, eps_pred, t_cur, t_next)
 
-            # §4.1 불확실성 주입 schedule
+            # §4.1 / §7.1 불확실성 주입 schedule (scale 적용)
             is_last = (i == n_steps - 1)
             inject_now = (mode == "all") or (mode == "last" and is_last)
             if inject_now:
-                z = z + torch.exp(0.5 * log_var) * torch.randn_like(z)
+                z = z + inject_scale * torch.exp(0.5 * log_var) * torch.randn_like(z)
 
         return z, log_var
 
@@ -170,19 +175,31 @@ def generate_future_ensemble(
     device: torch.device | str = "cuda",
     past_num_steps: int | None = None,
     main_num_steps: int | None = None,
+    past_inject_mode: str = "all",
+    past_inject_scale: float = 0.1,
+    clim_bank=None,
+    doy_t=None,
+    doy_tm1=None,
+    doy_tp1=None,
 ) -> tuple[torch.Tensor, dict]:
-    """단일 관측 x_t에 대해 중심 프레임 x_t 앙상블 생성 (batched).
+    """단일 관측 x̃_t(표준화 anomaly)에 대해 중심 프레임 앙상블 생성 (batched).
 
-    past가 멤버별로 다양한 이웃 [x̂_{t-1}, x̂_{t+1}]를 생성(마지막 step에서만 logvar 주입)
-    하고, main이 각 멤버를 x̂_t로 복원한다. 앙상블 다양성은 past의 불확실성 주입에서
-    발생해 main으로 전파된다. 앙상블 차원을 batch dim에 펼쳐 past 1회 + main 1회만 호출.
+    past가 멤버별로 다양한 이웃 anomaly [x̃_{t-1}, x̃_{t+1}]를 생성(SPEC §7.1: 매 step
+    logvar·scale 주입)하고, main이 각 멤버를 x̃_t로 복원한다. 앙상블 다양성은 past의
+    불확실성 주입에서 발생해 main으로 전파된다. 앙상블 차원을 batch dim에 펼쳐
+    past 1회 + main 1회만 호출.
+
+    `clim_bank` 가 주어지면 출력 anomaly 를 doy 별 climatology 로 **역표준화하여
+    픽셀 00시 스냅샷장** 으로 복원한다 (SPEC §9.2 step 4). 없으면 anomaly 그대로 반환.
 
     Args:
-        x_t:            (1, C, H, W) 관측 중심 프레임
-        past_num_steps: DDPM_past denoising step 수 (None이면 sampler 기본값)
-        main_num_steps: DDPM_main denoising step 수 (None이면 sampler 기본값)
+        x_t:               (1, C, H, W) 관측 중심 프레임의 표준화 anomaly x̃_t
+        past_inject_mode:  DDPM_past 주입 schedule ('all' 권장)
+        past_inject_scale: DDPM_past 주입 scale (0.1 권장)
+        clim_bank:         ClimatologyBank (None이면 역표준화 생략)
+        doy_t/tm1/tp1:     중심/이웃 doy 인덱스 (역표준화용; 스칼라 또는 (B,))
     Returns:
-        ensemble: (ensemble_size, 1, C, H, W) — 복원된 x̂_t 앙상블
+        ensemble: (ensemble_size, 1, C, H, W) — 복원된 x̂_t 앙상블 (clim 있으면 픽셀)
         diag:     진단용 dict (past/main log_var, 생성된 이웃)
     """
     B = ensemble_size
@@ -191,26 +208,45 @@ def generate_future_ensemble(
     cz = vae.latent_channels                                    # per-frame = 6
     H_z, W_z = normalizer.mu.shape[-2:]
 
-    # ── [1] DDPM_past: 다양한 이웃 [x̂_{t-1}, x̂_{t+1}] 생성 ─────────
-    # past condition = x_t (관측) — 모든 member 동일 → expand
-    cond_past = encoder(x_t.unsqueeze(1))                       # (1, 256, D), F=1
-    cond_past = cond_past.expand(B, -1, -1)                     # → (B, 256, D)
+    # ── climatology condition 조회 (§1: 생성 대상 시점). 전부 lookup, 생성 아님 ──
+    if clim_bank is not None:
+        # 정규화된 climatology
+        c_tm1 = clim_bank.climatology_pixel_norm(doy_tm1)      # (1, C, H, W)
+        c_tp1 = clim_bank.climatology_pixel_norm(doy_tp1)
+        c_t = clim_bank.climatology_pixel_norm(doy_t)
+    else:
+        c_tm1 = c_tp1 = c_t = None
+
+    # ── [1] DDPM_past: 다양한 이웃 anomaly [x̃_{t-1}, x̃_{t+1}] 생성 ──
+    # past condition (§1) = 중심 anomaly x̃_t + 이웃 climatology c̃_{t±1}(pixel-norm) — member 동일 → expand
+    cond_past = encoder(past_snapshots(x_t, c_tm1, c_tp1))      # (1, N_cond, D)
+    cond_past = cond_past.expand(B, -1, -1)                     # → (B, N_cond, D)
     z_past, lv_past = sampler.sample(
         dit_past, cond_past, (B, 2 * cz, H_z, W_z), device,
-        inject_uncertainty_mode="last",                        # past 전용, 마지막 step만
+        inject_uncertainty_mode=past_inject_mode,              # 'all' (SPEC §7.1)
+        inject_scale=past_inject_scale,                        # 0.1
         num_steps=past_num_steps,
     )
-    x_tm1_hat, x_tp1_hat = _decode_pair(vae, normalizer, z_past)   # 각 (B, C, H, W)
+    x_tm1_hat, x_tp1_hat = _decode_pair(vae, normalizer, z_past)   # anomaly 각 (B,C,H,W)
 
-    # ── [2] DDPM_main: x̂_t 복원 (불확실성 주입 없음) ──────────────
-    # main condition = [x̂_{t-1}, x̂_{t+1}] — 전부 past 생성물 (teacher forcing 금지)
-    cond_main = encoder(torch.stack([x_tm1_hat, x_tp1_hat], dim=1))  # (B, 512, D), F=2
+    # ── [2] DDPM_main: x̃_t 복원 (불확실성 주입 없음) ──────────────
+    # main condition (§1) = 이웃 anomaly [x̃_{t-1}, x̃_{t+1}] (past 생성물) + 중심 climatology c̃_t
+    c_t_b = c_t.expand(B, -1, -1, -1) if c_t is not None else None
+    cond_main = encoder(main_snapshots(x_tm1_hat, x_tp1_hat, c_t_b))
     z_main, lv_main = sampler.sample(
         dit_main, cond_main, (B, cz, H_z, W_z), device,
-        inject_uncertainty=False,                              # main은 주입 안 함
+        inject_uncertainty_mode="none",                        # main은 주입 안 함
         num_steps=main_num_steps,
     )
-    x_t_hat = vae.decode(normalizer.denormalize(z_main))       # (B, C, H, W)
+    x_t_hat = vae.decode(normalizer.denormalize(z_main))       # anomaly (B, C, H, W)
+
+    # ── [3] anomaly → 픽셀 역표준화 (local, SPEC §9.2 step 4) ──────
+    # 복원은 local 통계(c_mu_t, c_sig_t) 사용 — condition 의 pixel-norm 과 다른 정규화.
+    # 이웃 frame 은 각자 doy(t∓1)의 climatology 로 역표준화해야 정확.
+    if clim_bank is not None:
+        x_t_hat = clim_bank.destandardize_anomaly(x_t_hat, doy_t)
+        x_tm1_hat = clim_bank.destandardize_anomaly(x_tm1_hat, doy_tm1)
+        x_tp1_hat = clim_bank.destandardize_anomaly(x_tp1_hat, doy_tp1)
     ensemble = x_t_hat.reshape(B, 1, C, H, W)                  # 복원된 x̂_t
 
     return ensemble, {
@@ -272,12 +308,20 @@ def main() -> None:
         gamma_min=float(config["schedule"]["gamma_min"]),
         gamma_max=float(config["schedule"]["gamma_max"]),
     )
-    past_num_steps = int(config["sampling"]["past_num_steps"])
-    main_num_steps = int(config["sampling"]["main_num_steps"])
+    sc = config["sampling"]
+    past_num_steps = int(sc["past_num_steps"])
+    main_num_steps = int(sc["main_num_steps"])
+    past_inject_mode = sc.get("past_inject_mode", "all")
+    past_inject_scale = float(sc.get("past_inject_scale", 0.1))
     sampler = LatentVDMSampler(schedule, num_steps=past_num_steps)
 
+    # use_00utc_only(표준화 anomaly) 이면 climatology 로 역표준화하여 픽셀 복원.
+    use_anom = config["data"].get("use_00utc_only", False)
+    clim_bank = build_climatology(config).to(device) if use_anom else None
+
+    src_path, src_var = resolve_data_source(config)
     ds = ERA5NormalizedDataset(
-        normalized_path=config["data"]["normalized_path"],
+        normalized_path=src_path, var_name=src_var,
         mode="inference", split=args.split, load_into_memory=False,
     )
     out_dir = Path(args.output_dir)
@@ -286,23 +330,41 @@ def main() -> None:
     n_samples = min(args.n_samples, len(ds))
     print(f"[info] generating {args.ensemble_size}-member ensembles "
           f"for {n_samples} samples "
-          f"(past_steps={past_num_steps}, main_steps={main_num_steps})")
+          f"(past_steps={past_num_steps}, main_steps={main_num_steps}, "
+          f"past_inject={past_inject_mode}×{past_inject_scale}, "
+          f"clim={'on' if clim_bank is not None else 'off'})")
 
     results = []
     for i in tqdm(range(n_samples), desc="ensemble"):
         sample = ds[i]
-        # past condition = 관측 중심 프레임 x_t
+        # past condition = 관측 중심 프레임의 표준화 anomaly x̃_t
         x_t = sample["x_t"].unsqueeze(0)
+        # 역표준화용 doy (각 프레임의 실제 시각 기준).
+        if clim_bank is not None:
+            doy_t = clim_bank.doy_from_times(sample["time_t"])
+            doy_tm1 = clim_bank.doy_from_times(sample["time_tm1"])
+            doy_tp1 = clim_bank.doy_from_times(sample["time_tp1"])
+        else:
+            doy_t = doy_tm1 = doy_tp1 = None
 
         ensemble, diag = generate_future_ensemble(
             x_t, encoder, dit_past, dit_main, vae, normalizer,
             sampler, ensemble_size=args.ensemble_size, device=device,
             past_num_steps=past_num_steps, main_num_steps=main_num_steps,
+            past_inject_mode=past_inject_mode,
+            past_inject_scale=past_inject_scale,
+            clim_bank=clim_bank, doy_t=doy_t, doy_tm1=doy_tm1, doy_tp1=doy_tp1,
+        )
+        # GT 를 ensemble 과 같은 공간으로 저장 (clim on → 픽셀, off → anomaly).
+        x_t_gt = (
+            clim_bank.destandardize_anomaly(x_t.to(device), doy_t).cpu()
+            if clim_bank is not None else x_t.cpu()
         )
         torch.save(
             {
-                "ensemble": ensemble.cpu(),           # (M, 1, C, H, W) 복원 x̂_t
-                "x_t": x_t.cpu(),                     # 관측 GT
+                "ensemble": ensemble.cpu(),           # (M, 1, C, H, W) 복원 x̂_t (clim on→픽셀)
+                "x_t": x_t_gt,                        # 관측 GT (ensemble 과 동일 공간)
+                "x_t_anom": x_t.cpu(),                # 표준화 anomaly GT (참조)
                 "log_var_past": diag["log_var_past"],
                 "log_var_main": diag["log_var_main"],
                 "time_t": str(sample["time_t"]),

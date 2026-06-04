@@ -1,0 +1,32 @@
+# Diffusion²-LDM (v4) — 새 가상환경용 의존성
+# 코드 import 스캔 기준 third-party 패키지만 정리 (stdlib·로컬 모듈 제외).
+# 버전은 동작 검증된 환경(Python 3.12) 기준 핀.
+#
+# 설치 예:
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements2.txt
+#
+# ── PyTorch (CUDA) ──────────────────────────────────────────────
+# 아래는 CUDA 12.1 빌드(검증: 2.5.1+cu121). GPU/CUDA 버전에 맞게 설치하세요:
+#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+# CPU 전용이면 그냥 `pip install torch==2.5.1`.
+torch==2.5.1
+
+# ── 분산 학습 (accelerate launch, DDP) ──────────────────────────
+accelerate==1.12.0
+
+# ── 수치/배열 ───────────────────────────────────────────────────
+numpy==2.4.1
+pandas==2.3.3
+
+# ── ERA5 zarr 데이터 I/O (xarray + zarr backend + dask lazy) ────
+xarray==2025.12.0
+zarr==2.18.7
+dask==2026.1.1
+
+# ── 시각화 (experiments_dit figures) ────────────────────────────
+matplotlib==3.10.8
+
+# ── 진행바 / 설정 파싱 ──────────────────────────────────────────
+tqdm==4.67.2
+PyYAML==6.0.3

@@ -1,29 +1,31 @@
-"""v2 LDM/DiT — test set sub-sample (Mon/Wed/Fri)에 대한 N-member ensemble 생성.
+"""v4 LDM/DiT — test set 전체 시점에 대한 N-member ensemble 생성.
 
-중심-프레임 복원형 Dual-DDPM. DDPM_main 의 x_t 복원을 평가하기 위한 latent 앙상블을
-캐시한다 (inference/sampling.py:generate_future_ensemble 와 동일 파이프라인).
+중심-프레임 복원형 Dual-DDPM (climatology-anomaly 전환). DDPM_main 의 x_t 복원을
+평가하기 위한 latent 앙상블을 캐시한다 (inference/sampling.py:generate_future_ensemble
+와 동일 파이프라인 — §1 condition 규칙, §9 추론).
 
-파이프라인:
-    x_t  ──encoder──▶  cond_past
-        │ DDPM_past (마지막 step만 logvar 주입)
+파이프라인 (입력 x̃_t = 표준화 anomaly):
+    x̃_t (+ 이웃 climatology c̃_{t±1})  ──encoder──▶  cond_past
+        │ DDPM_past (매 step logvar 주입, scale 0.1 — SPEC §9.1)
         ▼
-    z_past(12ch) ──VAE decode──▶ [x̂_{t-1}, x̂_{t+1}]   (멤버별 다양)
-        │
-    [x̂_{t-1}, x̂_{t+1}]  ──encoder──▶  cond_main
+    z_past(12ch) ──VAE decode──▶ [x̃_{t-1}, x̃_{t+1}]   (멤버별 다양, anomaly)
+        │ (+ 중심 climatology c̃_t)
+    [x̃_{t-1}, x̃_{t+1}]  ──encoder──▶  cond_main
         │ DDPM_main (주입 없음)
         ▼
     z_main(6ch), log_var_main   ← 평가 대상 = 복원된 x̂_t
+        │ destandardize_anomaly (local, 물리단위 복원)
 
 캐시 schema (sample_{idx:05d}.npz):
-    ensemble            (N, 6, 16, 16)   정규화 latent ẑ_0 앙상블 = z_main (x̂_t)
+    ensemble            (N, 6, 16, 16)   정규화 anomaly latent ẑ_0 앙상블 = z_main
     log_var             (6, 16, 16)      latent dual-head log_var (멤버 평균)
-    x_t_true            (6, 16, 16)      GT x_t 의 latent 인코딩 (posterior μ)
-    ensemble_pixel      (N, 3, 64, 64)   디코딩된 x̂_t 픽셀 앙상블 (exp5/7/8)
-    x_t_true_pixel      (3, 64, 64)      GT x_t 픽셀 필드
+    x_t_true            (6, 16, 16)      GT x̃_t 의 latent 인코딩 (posterior μ)
+    ensemble_pixel      (N, 3, 64, 64)   복원된 x̂_t 픽셀 앙상블 (clim on → 물리단위)
+    x_t_true_pixel      (3, 64, 64)      GT x_t 픽셀 필드 (clim on → 물리단위)
     ensemble_pixel_tm1  (N, 3, 64, 64)   DDPM_past 가 생성한 x̂_{t-1} 멤버 앙상블
     ensemble_pixel_tp1  (N, 3, 64, 64)   DDPM_past 가 생성한 x̂_{t+1} 멤버 앙상블
-    x_tm1_true_pixel    (3, 64, 64)      GT x_{t-1} 픽셀 필드
-    x_tp1_true_pixel    (3, 64, 64)      GT x_{t+1} 픽셀 필드
+    x_tm1_true_pixel    (3, 64, 64)      GT x_{t-1} 픽셀 필드 (clim on → 물리단위)
+    x_tp1_true_pixel    (3, 64, 64)      GT x_{t+1} 픽셀 필드 (clim on → 물리단위)
     time_t              str(timestamp)
 """
 from __future__ import annotations
@@ -37,8 +39,10 @@ import torch
 import yaml
 from tqdm import tqdm
 
-from dataset.era5_dataset import ERA5NormalizedDataset
+from dataset.era5_dataset import ERA5NormalizedDataset, resolve_data_source
 from inference.sampling import LatentVDMSampler, _decode_pair, _load_models
+from models.climatology import build_climatology
+from models.encoder import main_snapshots, past_snapshots
 from models.schedule import VDMSchedule
 
 from .utils import ensure_dir
@@ -87,12 +91,23 @@ def _generate_main_ensemble(
     device: torch.device,
     past_num_steps: int | None = None,
     main_num_steps: int | None = None,
-    inject_uncertainty_mode: str = "last",
+    inject_uncertainty_mode: str = "all",
+    inject_scale: float = 0.1,
+    clim_bank=None,
+    doy_t=None,
+    doy_tm1=None,
+    doy_tp1=None,
 ) -> dict:
-    """관측 x_t → DDPM_main 의 x̂_t latent 앙상블 + 진단 캐시.
+    """관측 x̃_t(표준화 anomaly) → DDPM_main 의 x̂_t latent 앙상블 + 진단 캐시.
+
+    v4 climatology-anomaly 파이프라인 (inference/sampling.py:generate_future_ensemble
+    와 동일 규칙, §1/§9). past=중심 anomaly + 이웃 climatology, main=이웃 anomaly +
+    중심 climatology. clim_bank 가 있으면 픽셀 캐시는 **물리단위로 역표준화** 된다.
 
     Args:
-        x_t: (1, C, H, W) 관측 중심 프레임.
+        x_t: (1, C, H, W) 관측 중심 프레임의 표준화 anomaly x̃_t.
+        clim_bank: ClimatologyBank (None이면 legacy anomaly-only, 역표준화 생략).
+        doy_t/tm1/tp1: climatology 조회·역표준화용 doy (스칼라 또는 (1,)).
 
     Returns:
         dict — 캐시 키 (ensemble, log_var, x_t_true, ensemble_pixel,
@@ -106,24 +121,36 @@ def _generate_main_ensemble(
     cz = vae.latent_channels                                       # per-frame = 6
     H_z, W_z = normalizer.mu.shape[-2:]
 
-    # ── [1] DDPM_past: 다양한 이웃 [x̂_{t-1}, x̂_{t+1}] 생성 ─────────
-    cond_past = encoder(x_t.unsqueeze(1))                          # (1, 256, D), F=1
-    cond_past = cond_past.expand(B, -1, -1)                        # → (B, 256, D)
+    # ── climatology condition 조회 (§1: 생성 대상 시점). 전부 lookup ──
+    if clim_bank is not None:
+        c_tm1 = clim_bank.climatology_pixel_norm(doy_tm1)          # (1, C, H, W)
+        c_tp1 = clim_bank.climatology_pixel_norm(doy_tp1)
+        c_t = clim_bank.climatology_pixel_norm(doy_t)
+    else:
+        c_tm1 = c_tp1 = c_t = None
+
+    # ── [1] DDPM_past: 다양한 이웃 anomaly [x̃_{t-1}, x̃_{t+1}] 생성 ──
+    # past condition (§1) = 중심 anomaly x̃_t + 이웃 climatology c̃_{t±1}(pixel-norm).
+    cond_past = encoder(past_snapshots(x_t, c_tm1, c_tp1))         # (1, N_cond, D)
+    cond_past = cond_past.expand(B, -1, -1)                        # → (B, N_cond, D)
     z_past, _ = sampler.sample(
         dit_past, cond_past, (B, 2 * cz, H_z, W_z), device,
-        inject_uncertainty_mode=inject_uncertainty_mode,
+        inject_uncertainty_mode=inject_uncertainty_mode,          # 'all' (SPEC §9.1)
+        inject_scale=inject_scale,                                # 0.1
         num_steps=past_num_steps,
     )
-    x_tm1_hat, x_tp1_hat = _decode_pair(vae, normalizer, z_past)   # 각 (B, C, H, W)
+    x_tm1_hat, x_tp1_hat = _decode_pair(vae, normalizer, z_past)   # anomaly 각 (B,C,H,W)
 
-    # ── [2] DDPM_main: x̂_t 복원 (불확실성 주입 없음) ──────────────
-    cond_main = encoder(torch.stack([x_tm1_hat, x_tp1_hat], dim=1))  # (B, 512, D), F=2
+    # ── [2] DDPM_main: x̃_t 복원 (불확실성 주입 없음) ──────────────
+    # main condition (§1) = 이웃 anomaly (past 생성물) + 중심 climatology c̃_t.
+    c_t_b = c_t.expand(B, -1, -1, -1) if c_t is not None else None
+    cond_main = encoder(main_snapshots(x_tm1_hat, x_tp1_hat, c_t_b))
     z_main, lv_main = sampler.sample(
         dit_main, cond_main, (B, cz, H_z, W_z), device,
-        inject_uncertainty=False,
+        inject_uncertainty_mode="none",                           # main은 주입 안 함
         num_steps=main_num_steps,
     )
-    ensemble_pixel = vae.decode(normalizer.denormalize(z_main))    # (B, C, H, W) = x̂_t
+    x_t_hat = vae.decode(normalizer.denormalize(z_main))          # anomaly (B, C, H, W)
 
     # log_var 멤버 reduce
     if _LOG_VAR_MEMBER_REDUCE == "mean":
@@ -131,17 +158,27 @@ def _generate_main_ensemble(
     else:
         log_var = lv_main[0]
 
-    # GT x_t 의 latent 인코딩 (posterior μ, 샘플 아님)
+    # GT x_t 의 latent 인코딩 (posterior μ, 샘플 아님) — anomaly latent.
     mu_gt, _ = vae.encode(x_t)                                    # (1, C_z, H_z, W_z)
     x_t_true = normalizer.normalize(mu_gt)[0]                      # (C_z, H_z, W_z)
+
+    # ── 픽셀 캐시: clim 있으면 anomaly → 물리단위 역표준화 (local, §9.2) ──
+    if clim_bank is not None:
+        ensemble_pixel = clim_bank.destandardize_anomaly(x_t_hat, doy_t)
+        x_t_true_pixel = clim_bank.destandardize_anomaly(x_t, doy_t)[0]
+        x_tm1_hat = clim_bank.destandardize_anomaly(x_tm1_hat, doy_tm1)
+        x_tp1_hat = clim_bank.destandardize_anomaly(x_tp1_hat, doy_tp1)
+    else:
+        ensemble_pixel = x_t_hat
+        x_t_true_pixel = x_t[0]
 
     return {
         "ensemble": z_main.detach().cpu(),
         "log_var": log_var.detach().cpu(),
         "x_t_true": x_t_true.detach().cpu(),
         "ensemble_pixel": ensemble_pixel.detach().cpu(),
-        "x_t_true_pixel": x_t[0].detach().cpu(),
-        # DDPM_past 가 멤버별로 생성한 이웃 프레임 (mode=last 주입) — exp 신규 분석용.
+        "x_t_true_pixel": x_t_true_pixel.detach().cpu(),
+        # DDPM_past 가 멤버별로 생성한 이웃 프레임 (clim 있으면 물리단위) — exp 분석용.
         "ensemble_pixel_tm1": x_tm1_hat.detach().cpu(),    # (B, C, H, W) = x̂_{t-1}
         "ensemble_pixel_tp1": x_tp1_hat.detach().cpu(),    # (B, C, H, W) = x̂_{t+1}
     }
@@ -154,7 +191,7 @@ def run_inference(
     n_members: int,
     past_num_steps: int | None = None,
     main_num_steps: int | None = None,
-    sub_sample: bool = True,
+    sub_sample: bool = False,
     limit: int | None = None,
     seed: int = 42,
     inject_uncertainty_mode: str = "all",
@@ -205,9 +242,20 @@ def run_inference(
         main_num_steps = int(samp_cfg.get("main_num_steps", _default_steps))
     sampler = LatentVDMSampler(schedule, num_steps=past_num_steps)
 
-    # 3시점 윈도우(x_{t-1}, x_t, x_{t+1}) 반환 — 여기선 관측 x_t 만 사용.
+    # DDPM_past 주입: CLI override 우선, 없으면 config (기본 all × 0.1, SPEC §9.1).
+    if inject_uncertainty_mode is None:
+        inject_uncertainty_mode = samp_cfg.get("past_inject_mode", "all")
+    inject_scale = float(samp_cfg.get("past_inject_scale", 0.1))
+
+    # use_00utc_only(표준화 anomaly) 이면 climatology condition 조회 + 물리단위 복원.
+    use_anom = config["data"].get("use_00utc_only", False)
+    clim_bank = build_climatology(config).to(device) if use_anom else None
+
+    # 3시점 윈도우(x̃_{t-1}, x̃_t, x̃_{t+1}) 반환 — past cond=x̃_t, 이웃은 GT 평가용.
+    src_path, src_var = resolve_data_source(config)
     ds = ERA5NormalizedDataset(
-        normalized_path=config["data"]["normalized_path"],
+        normalized_path=src_path,
+        var_name=src_var,
         mode="train",
         split="test",
         load_into_memory=False,
@@ -232,8 +280,9 @@ def run_inference(
     my_indices = keep_rel[rank::world]
 
     info(f"[info] checkpoint={checkpoint_path}")
-    info(f"[info] {n_members}-member, DDPM_past inject_mode="
-         f"{inject_uncertainty_mode!r}, latent VDM sampler "
+    info(f"[info] {n_members}-member, DDPM_past inject="
+         f"{inject_uncertainty_mode!r}×{inject_scale}, "
+         f"clim={'on' if clim_bank is not None else 'off'}, latent VDM sampler "
          f"past_steps={past_num_steps} main_steps={main_num_steps}")
     info(f"[info] {len(keep_rel)} timesteps total, "
          f"world={world} → {len(my_positions)} per process (rank0)")
@@ -252,12 +301,32 @@ def run_inference(
         x_t = sample["x_t"].unsqueeze(0)
         time_t = sample["time_t"]
 
+        # 역표준화·climatology 조회용 doy (각 프레임의 실제 시각 기준).
+        if clim_bank is not None:
+            doy_t = clim_bank.doy_from_times(sample["time_t"])
+            doy_tm1 = clim_bank.doy_from_times(sample["time_tm1"])
+            doy_tp1 = clim_bank.doy_from_times(sample["time_tp1"])
+        else:
+            doy_t = doy_tm1 = doy_tp1 = None
+
         cache = _generate_main_ensemble(
             x_t, encoder, dit_past, dit_main, vae, normalizer,
             sampler, n_members=n_members, device=device,
             past_num_steps=past_num_steps, main_num_steps=main_num_steps,
             inject_uncertainty_mode=inject_uncertainty_mode,
+            inject_scale=inject_scale,
+            clim_bank=clim_bank, doy_t=doy_t, doy_tm1=doy_tm1, doy_tp1=doy_tp1,
         )
+
+        # GT 이웃은 dataset 의 anomaly x̃ → ensemble_pixel 과 같은 공간(물리단위)으로 저장.
+        if clim_bank is not None:
+            x_tm1_true_pixel = clim_bank.destandardize_anomaly(
+                sample["x_tm1"].unsqueeze(0).to(device), doy_tm1)[0].cpu()
+            x_tp1_true_pixel = clim_bank.destandardize_anomaly(
+                sample["x_tp1"].unsqueeze(0).to(device), doy_tp1)[0].cpu()
+        else:
+            x_tm1_true_pixel = sample["x_tm1"]
+            x_tp1_true_pixel = sample["x_tp1"]
 
         out_path = out_dir / f"sample_{int(save_idx):05d}.npz"
         np.savez(
@@ -269,8 +338,8 @@ def run_inference(
             x_t_true_pixel=cache["x_t_true_pixel"].numpy().astype(np.float32),
             ensemble_pixel_tm1=cache["ensemble_pixel_tm1"].numpy().astype(np.float32),
             ensemble_pixel_tp1=cache["ensemble_pixel_tp1"].numpy().astype(np.float32),
-            x_tm1_true_pixel=sample["x_tm1"].numpy().astype(np.float32),
-            x_tp1_true_pixel=sample["x_tp1"].numpy().astype(np.float32),
+            x_tm1_true_pixel=x_tm1_true_pixel.numpy().astype(np.float32),
+            x_tp1_true_pixel=x_tp1_true_pixel.numpy().astype(np.float32),
             time_t=np.array(str(time_t)),
         )
 
@@ -292,15 +361,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--main_num_steps", type=int, default=None,
                    help="DDPM_main denoising step 수 "
                         "(미지정 시 config['sampling']['main_num_steps']).")
-    p.add_argument("--no_subsample", action="store_true",
-                   help="설정 시 모든 test 시점 사용")
+    p.add_argument("--subsample_mwf", action="store_true",
+                   help="설정 시 월/수/금 시점만 사용 (기본: 전체 test 시점).")
     p.add_argument("--limit", type=int, default=None,
                    help="디버깅용: 처음 N개 시점만 생성")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--inject_uncertainty_mode", default="last",
+    p.add_argument("--inject_uncertainty_mode", default=None,
                    choices=["all", "last", "none"],
                    help="DDPM_past 의 dual-head log_var 노이즈 주입 schedule. "
-                        "'last'(마지막 step만, 기본·학습과 일치) / 'all' / 'none'.")
+                        "미지정 시 config sampling.past_inject_mode (기본 'all', SPEC §9.1).")
     return p.parse_args()
 
 
@@ -313,7 +382,7 @@ def main() -> None:
         n_members=args.n_members,
         past_num_steps=args.past_num_steps,
         main_num_steps=args.main_num_steps,
-        sub_sample=not args.no_subsample,
+        sub_sample=args.subsample_mwf,
         limit=args.limit,
         seed=args.seed,
         inject_uncertainty_mode=args.inject_uncertainty_mode,

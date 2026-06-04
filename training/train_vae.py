@@ -26,19 +26,20 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 from torch.utils.data import DataLoader
 
-from dataset.era5_dataset import ERA5FrameDataset
+from dataset.era5_dataset import ERA5FrameDataset, resolve_data_source
 from models.vae import build_vae, weather_vae_loss
 
 
 def _build_dataloaders(config: dict) -> tuple[DataLoader, DataLoader]:
-    data_cfg = config["data"]
     vt = config["vae"]["training"]
+    # use_00utc_only 이면 VAE 가 표준화 anomaly 00시 스냅샷 프레임을 본다 (SPEC §6).
+    src_path, src_var = resolve_data_source(config)
     train_ds = ERA5FrameDataset(
-        normalized_path=data_cfg["normalized_path"],
+        normalized_path=src_path, var_name=src_var,
         split="train", load_into_memory=True,
     )
     val_ds = ERA5FrameDataset(
-        normalized_path=data_cfg["normalized_path"],
+        normalized_path=src_path, var_name=src_var,
         split="validation", load_into_memory=True,
     )
     train_loader = DataLoader(

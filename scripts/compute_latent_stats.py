@@ -27,7 +27,7 @@ import yaml
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from dataset.era5_dataset import ERA5FrameDataset
+from dataset.era5_dataset import ERA5FrameDataset, resolve_data_source
 from models.vae import build_vae
 
 
@@ -121,9 +121,10 @@ def main() -> None:
     for param in vae.parameters():
         param.requires_grad = False
 
-    # ── 학습 split의 모든 개별 프레임 ──────────────────────────────
+    # ── 학습 split의 모든 개별 프레임 (use_00utc_only 이면 표준화 anomaly) ──
+    src_path, src_var = resolve_data_source(config)
     ds = ERA5FrameDataset(
-        normalized_path=config["data"]["normalized_path"],
+        normalized_path=src_path, var_name=src_var,
         split="train",
         load_into_memory=False,
     )
